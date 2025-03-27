@@ -7,6 +7,11 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable, Coroutine, List, Literal, Optional, Tuple, Union
 
+try:
+  import cv2  # type: ignore
+except ImportError:
+  cv2 = None  # type: ignore
+
 from pylabrobot.resources.plate import Plate
 
 try:
@@ -45,47 +50,6 @@ PixelFormat_Mono8 = PySpin.PixelFormat_Mono8 if USE_PYSPIN else -1
 SpinnakerException = PySpin.SpinnakerException if USE_PYSPIN else Exception
 
 
-def _laplacian_2d(u):
-  # thanks chat (one shotted this)
-  # verified to be the same as scipy.ndimage.laplace
-  # 6.09 ms ± 40.5 µs per loop (mean ± std. dev. of 7 runs, 100 loops each)
-
-  # Assumes u is a 2D numpy array and that dx = dy = 1
-  laplacian = np.zeros_like(u)
-
-  # Applying the finite difference approximation for interior points
-  laplacian[1:-1, 1:-1] = (u[2:, 1:-1] - 2 * u[1:-1, 1:-1] + u[:-2, 1:-1]) + (
-    u[1:-1, 2:] - 2 * u[1:-1, 1:-1] + u[1:-1, :-2]
-  )
-
-  # Handle the edges using reflection
-  laplacian[0, 1:-1] = (u[1, 1:-1] - 2 * u[0, 1:-1] + u[0, 1:-1]) + (
-    u[0, 2:] - 2 * u[0, 1:-1] + u[0, :-2]
-  )
-
-  laplacian[-1, 1:-1] = (u[-2, 1:-1] - 2 * u[-1, 1:-1] + u[-1, 1:-1]) + (
-    u[-1, 2:] - 2 * u[-1, 1:-1] + u[-1, :-2]
-  )
-
-  laplacian[1:-1, 0] = (u[2:, 0] - 2 * u[1:-1, 0] + u[:-2, 0]) + (
-    u[1:-1, 1] - 2 * u[1:-1, 0] + u[1:-1, 0]
-  )
-
-  laplacian[1:-1, -1] = (u[2:, -1] - 2 * u[1:-1, -1] + u[:-2, -1]) + (
-    u[1:-1, -2] - 2 * u[1:-1, -1] + u[1:-1, -1]
-  )
-
-  # Handle the corners (reflection)
-  laplacian[0, 0] = (u[1, 0] - 2 * u[0, 0] + u[0, 0]) + (u[0, 1] - 2 * u[0, 0] + u[0, 0])
-  laplacian[0, -1] = (u[1, -1] - 2 * u[0, -1] + u[0, -1]) + (u[0, -2] - 2 * u[0, -1] + u[0, -1])
-  laplacian[-1, 0] = (u[-2, 0] - 2 * u[-1, 0] + u[-1, 0]) + (u[-1, 1] - 2 * u[-1, 0] + u[-1, 0])
-  laplacian[-1, -1] = (u[-2, -1] - 2 * u[-1, -1] + u[-1, -1]) + (
-    u[-1, -2] - 2 * u[-1, -1] + u[-1, -1]
-  )
-
-  return laplacian
-
-
 async def _golden_ratio_search(
   func: Callable[..., Coroutine[Any, Any, float]], a: float, b: float, tol: float, timeout: float
 ):
@@ -118,6 +82,10 @@ class Cytation5ImagingConfig:
   camera_serial_number: Optional[str] = None
   max_image_read_attempts: int = 8
 
+  # if not specified, these will be loaded from machine configuration (register with gen5.exe)
+  objectives: Optional[List[Optional[Objective]]] = None
+  filters: Optional[List[Optional[ImagingMode]]] = None
+
 
 class Cytation5Backend(ImageReaderBackend):
   """Backend for biotek cytation 5 image reader.
@@ -140,8 +108,8 @@ class Cytation5Backend(ImageReaderBackend):
     self.spinnaker_system: Optional["PySpin.SystemPtr"] = None
     self.cam: Optional["PySpin.CameraPtr"] = None
     self.imaging_config = imaging_config or Cytation5ImagingConfig()
-    self._filters: List[Optional[ImagingMode]] = []
-    self._objectives: List[Optional[Objective]] = []
+    self._filters: Optional[List[Optional[ImagingMode]]] = self.imaging_config.filters
+    self._objectives: Optional[List[Optional[Objective]]] = self.imaging_config.objectives
     self._version: Optional[str] = None
 
     self._plate: Optional[Plate] = None
@@ -263,51 +231,73 @@ class Cytation5Backend(ImageReaderBackend):
       ptr_trigger_mode.SetIntValue(int(ptr_trigger_on.GetNumericValue()))
 
       # -- Load filter information --
-      for spot in range(1, 5):
-        configuration = await self.send_command("i", f"q{spot}")
-        assert configuration is not None
-        parts = configuration.decode().strip().split(" ")
-        if len(parts) == 1:
-          self._filters.append(None)
-        else:
-          cytation_code = int(parts[0])
-          cytation_code2imaging_mode = {
-            1225121: ImagingMode.C377_647,
-            1225123: ImagingMode.C400_647,
-            1225113: ImagingMode.C469_593,
-            1225109: ImagingMode.ACRIDINE_ORANGE,
-            1225107: ImagingMode.CFP,
-            1225118: ImagingMode.CFP_FRET_V2,
-            1225110: ImagingMode.CFP_YFP_FRET,
-            1225119: ImagingMode.CFP_YFP_FRET_V2,
-            1225112: ImagingMode.CHLOROPHYLL_A,
-            1225105: ImagingMode.CY5,
-            1225114: ImagingMode.CY5_5,
-            1225106: ImagingMode.CY7,
-            1225100: ImagingMode.DAPI,
-            1225101: ImagingMode.GFP,
-            1225116: ImagingMode.GFP_CY5,
-            1225122: ImagingMode.OXIDIZED_ROGFP2,
-            1225111: ImagingMode.PROPOIDIUM_IODIDE,
-            1225103: ImagingMode.RFP,
-            1225117: ImagingMode.RFP_CY5,
-            1225115: ImagingMode.TAG_BFP,
-            1225102: ImagingMode.TEXAS_RED,
-            1225104: ImagingMode.YFP,
-          }
-          if cytation_code not in cytation_code2imaging_mode:
-            self._filters.append(None)
-          else:
-            self._filters.append(cytation_code2imaging_mode[cytation_code])
+      if self._filters is None:
+        await self._load_filters()
 
       # -- Load objective information --
-      await self._load_objectives()
+      if self._objectives is None:
+        await self._load_objectives()
 
-  async def _load_objectives(self):
+  @property
+  def version(self) -> str:
     if self._version is None:
       raise RuntimeError("Firmware version is not set")
+    return self._version
 
-    if self._version.startswith("1"):
+  @property
+  def objectives(self) -> List[Optional[Objective]]:
+    if self._objectives is None:
+      raise RuntimeError("Objectives are not set")
+    return self._objectives
+
+  @property
+  def filters(self) -> List[Optional[ImagingMode]]:
+    if self._filters is None:
+      raise RuntimeError("Filters are not set")
+    return self._filters
+
+  async def _load_filters(self):
+    self._filters = []
+    for spot in range(1, 5):
+      configuration = await self.send_command("i", f"q{spot}")
+      assert configuration is not None
+      parts = configuration.decode().strip().split(" ")
+      if len(parts) == 1:
+        self._filters.append(None)
+      else:
+        cytation_code = int(parts[0])
+        cytation_code2imaging_mode = {
+          1225121: ImagingMode.C377_647,
+          1225123: ImagingMode.C400_647,
+          1225113: ImagingMode.C469_593,
+          1225109: ImagingMode.ACRIDINE_ORANGE,
+          1225107: ImagingMode.CFP,
+          1225118: ImagingMode.CFP_FRET_V2,
+          1225110: ImagingMode.CFP_YFP_FRET,
+          1225119: ImagingMode.CFP_YFP_FRET_V2,
+          1225112: ImagingMode.CHLOROPHYLL_A,
+          1225105: ImagingMode.CY5,
+          1225114: ImagingMode.CY5_5,
+          1225106: ImagingMode.CY7,
+          1225100: ImagingMode.DAPI,
+          1225101: ImagingMode.GFP,
+          1225116: ImagingMode.GFP_CY5,
+          1225122: ImagingMode.OXIDIZED_ROGFP2,
+          1225111: ImagingMode.PROPOIDIUM_IODIDE,
+          1225103: ImagingMode.RFP,
+          1225117: ImagingMode.RFP_CY5,
+          1225115: ImagingMode.TAG_BFP,
+          1225102: ImagingMode.TEXAS_RED,
+          1225104: ImagingMode.YFP,
+        }
+        if cytation_code not in cytation_code2imaging_mode:
+          self._filters.append(None)
+        else:
+          self._filters.append(cytation_code2imaging_mode[cytation_code])
+
+  async def _load_objectives(self):
+    self._objectives = []
+    if self.version.startswith("1"):
       for spot in [1, 2]:
         configuration = await self.send_command("i", f"o{spot}")
         weird_encoding = {  # ?
@@ -382,7 +372,7 @@ class Cytation5Backend(ImageReaderBackend):
           "UPLSAPO 20X": Objective.O_20X_PL_APO,
         }
         self._objectives.append(part_number2objective[part_number])
-    elif self._version.startswith("2"):
+    elif self.version.startswith("2"):
       for spot in range(1, 7):
         # +1 for some reason, eg first is h2
         configuration = await self.send_command("i", f"h{spot + 1}")
@@ -398,7 +388,7 @@ class Cytation5Backend(ImageReaderBackend):
           }
           self._objectives.append(annulus_part_number2objective[annulus_part_number])
     else:
-      raise RuntimeError(f"Unsupported version: {self._version}")
+      raise RuntimeError(f"Unsupported version: {self.version}")
 
   async def stop(self) -> None:
     logger.info("[cytation5] stopping")
@@ -411,8 +401,8 @@ class Cytation5Backend(ImageReaderBackend):
     if hasattr(self, "spinnaker_system") and self.spinnaker_system is not None:
       self.spinnaker_system.ReleaseInstance()
 
-    self._objectives = []
-    self._filters = []
+    self._objectives = None
+    self._filters = None
 
   async def _purge_buffers(self) -> None:
     """Purge the RX and TX buffers, as implemented in Gen5.exe"""
@@ -876,8 +866,21 @@ class Cytation5Backend(ImageReaderBackend):
         gain=gain,
       )
       image = images[0]  # self.capture returns List now
-      laplacian = _laplacian_2d(np.asarray(image))
-      return np.var(laplacian)
+
+      if cv2 is None:
+        raise RuntimeError("cv2 needs to be installed for auto focus")
+
+      # NVMG: Normalized Variance of the Gradient Magnitude
+      # Chat invented this i think
+      np_image = np.array(image, dtype=np.float64)
+      sobel_x = cv2.Sobel(np_image, cv2.CV_64F, 1, 0, ksize=3)
+      sobel_y = cv2.Sobel(np_image, cv2.CV_64F, 0, 1, ksize=3)
+      gradient_magnitude = np.sqrt(sobel_x**2 + sobel_y**2)
+
+      mean_gm = np.mean(gradient_magnitude)
+      var_gm = np.var(gradient_magnitude)
+      sharpness = var_gm / (mean_gm + 1e-6)
+      return sharpness
 
     # Use golden ratio search to find the best focus value
     focus_min, focus_max = self._auto_focus_search_range or (1.8, 2.5)
@@ -995,10 +998,10 @@ class Cytation5Backend(ImageReaderBackend):
   def _imaging_mode_code(self, mode: ImagingMode) -> int:
     if mode == ImagingMode.BRIGHTFIELD or mode == ImagingMode.PHASE_CONTRAST:
       return 5
-    return self._filters.index(mode) + 1
+    return self.filters.index(mode) + 1
 
   def _objective_code(self, objective: Objective) -> int:
-    return self._objectives.index(objective) + 1
+    return self.objectives.index(objective) + 1
 
   async def set_objective(self, objective: Objective):
     if objective == self._objective:
@@ -1009,7 +1012,11 @@ class Cytation5Backend(ImageReaderBackend):
       raise RuntimeError("Need to set imaging_config first")
 
     objective_code = self._objective_code(objective)
-    await self.send_command("Y", f"P0e{objective_code:02}", timeout=60)
+
+    if self.version.startswith("1"):
+      await self.send_command("Y", f"P0d{objective_code:02}", timeout=60)
+    else:
+      await self.send_command("Y", f"P0e{objective_code:02}", timeout=60)
 
     self._objective = objective
 
@@ -1033,18 +1040,28 @@ class Cytation5Backend(ImageReaderBackend):
 
     filter_index = self._imaging_mode_code(mode)
 
-    if mode == ImagingMode.PHASE_CONTRAST:
-      await self.send_command("Y", "P1120")
-      await self.send_command("Y", "P0d05")
-      await self.send_command("Y", "P1002")
-    elif mode == ImagingMode.BRIGHTFIELD:
-      await self.send_command("Y", "P1101")
-      await self.send_command("Y", "P0d05")
-      await self.send_command("Y", "P1002")
+    if self.version.startswith("1"):
+      if mode == ImagingMode.PHASE_CONTRAST:
+        raise NotImplementedError("Phase contrast imaging not implemented yet on Cytation1")
+      elif mode == ImagingMode.BRIGHTFIELD:
+        await self.send_command("Y", "P0c05")
+        await self.send_command("Y", "P0f02")
+      else:
+        await self.send_command("Y", f"P0c{filter_index:02}")
+        await self.send_command("Y", "P0f01")
     else:
-      await self.send_command("Y", "P1101")
-      await self.send_command("Y", f"P0d{filter_index:02}")
-      await self.send_command("Y", "P1001")
+      if mode == ImagingMode.PHASE_CONTRAST:
+        await self.send_command("Y", "P1120")
+        await self.send_command("Y", "P0d05")
+        await self.send_command("Y", "P1002")
+      elif mode == ImagingMode.BRIGHTFIELD:
+        await self.send_command("Y", "P1101")
+        await self.send_command("Y", "P0d05")
+        await self.send_command("Y", "P1002")
+      else:
+        await self.send_command("Y", "P1101")
+        await self.send_command("Y", f"P0d{filter_index:02}")
+        await self.send_command("Y", "P1001")
 
     # Turn led on in the new mode
     self._imaging_mode = mode
@@ -1182,6 +1199,7 @@ class Cytation5Backend(ImageReaderBackend):
     images: List[Image] = []
     for x_pos, y_pos in positions:
       await self.set_position(x=x_pos, y=y_pos)
+      await asyncio.sleep(0.1)
       images.append(
         await self._acquire_image(
           color_processing_algorithm=color_processing_algorithm, pixel_format=pixel_format
