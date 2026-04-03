@@ -5,7 +5,7 @@ Role: Drop-in replacement for CytationBackend — same serial protocol for
   filter wheel, objective turret, focus motor, LED, and well positioning,
   but uses AravisCamera for image acquisition instead of PySpin.
 Adjacent layers:
-  - Above: PLR MicroscopyCapability calls capture()
+  - Above: PLR Microscopy capability calls capture()
   - Below: BioTekBackend serial IO (filter/objective/focus/LED) +
            AravisCamera (image acquisition via Aravis/GenICam)
 
@@ -34,6 +34,7 @@ from typing import List, Literal, Optional, Tuple, Union
 
 import numpy as np
 
+from pylabrobot.capabilities.capability import BackendParams
 from pylabrobot.capabilities.microscopy.backend import MicroscopyBackend
 from pylabrobot.capabilities.microscopy.standard import (
     Exposure,
@@ -45,6 +46,7 @@ from pylabrobot.capabilities.microscopy.standard import (
     Objective,
 )
 from pylabrobot.resources.plate import Plate
+from pylabrobot.serializer import SerializableMixin
 
 from .aravis_camera import AravisCamera
 from .biotek import BioTekBackend
@@ -564,6 +566,22 @@ class CytationAravisBackend(BioTekBackend, MicroscopyBackend):
     # serial command "y". Do NOT override — the Cytation needs this to
     # position the stage correctly.
 
+    # ─── Vendor Params ──────────────────────────────────────────────────
+
+    @dataclass
+    class CaptureParams(BackendParams):
+        """Aravis-specific capture parameters.
+
+        Passed via ``backend_params`` in ``Microscopy.capture()``.
+        Mirrors CytationBackend.CaptureParams but without PySpin-specific
+        fields (color_processing_algorithm, pixel_format).
+        """
+
+        led_intensity: int = 10
+        coverage: Union[Literal["full"], Tuple[int, int]] = (1, 1)
+        center_position: Optional[Tuple[float, float]] = None
+        auto_stop_acquisition: bool = True
+
     # ─── MicroscopyBackend.capture() ─────────────────────────────────────
 
     async def capture(
@@ -576,10 +594,7 @@ class CytationAravisBackend(BioTekBackend, MicroscopyBackend):
         focal_height: FocalPosition,
         gain: Gain,
         plate: Plate,
-        led_intensity: int = 10,
-        coverage: Union[Literal["full"], Tuple[int, int]] = (1, 1),
-        center_position: Optional[Tuple[float, float]] = None,
-        **kwargs,
+        backend_params: Optional[SerializableMixin] = None,
     ) -> ImagingResult:
         """Capture image(s) from a well. Implements MicroscopyBackend.capture().
 
@@ -594,9 +609,17 @@ class CytationAravisBackend(BioTekBackend, MicroscopyBackend):
         8. Trigger and grab image (AravisCamera → Aravis buffer)
         9. Return ImagingResult
 
-        This mirrors CytationBackend.capture() but with simplified tiling
-        (single position only for the initial proof-of-concept).
+        This mirrors CytationBackend.capture() but uses AravisCamera
+        instead of PySpin for image acquisition.
         """
+        if not isinstance(backend_params, self.CaptureParams):
+            backend_params = CytationAravisBackend.CaptureParams()
+
+        led_intensity = backend_params.led_intensity
+        coverage = backend_params.coverage
+        center_position = backend_params.center_position
+        auto_stop_acquisition = backend_params.auto_stop_acquisition
+
         await self.set_plate(plate)
 
         if not self._acquiring:
@@ -651,7 +674,8 @@ class CytationAravisBackend(BioTekBackend, MicroscopyBackend):
 
         finally:
             await self.led_off()
-            self.stop_acquisition()
+            if auto_stop_acquisition:
+                self.stop_acquisition()
 
         exposure_ms = await self._aravis.get_exposure()
         focal_height_val = float(self._focal_height) if self._focal_height else 0.0
