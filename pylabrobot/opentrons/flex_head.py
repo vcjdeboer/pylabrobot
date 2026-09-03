@@ -24,7 +24,21 @@ tracks it.
 """
 
 import logging
-from typing import TYPE_CHECKING, Any, Dict, FrozenSet, List, Optional, Sequence, Tuple, Union, cast
+from typing import (
+  TYPE_CHECKING,
+  Any,
+  Dict,
+  Final,
+  FrozenSet,
+  List,
+  Literal,
+  Optional,
+  Sequence,
+  Set,
+  Tuple,
+  Union,
+  cast,
+)
 
 from pylabrobot.opentrons.checks import traversal_z
 from pylabrobot.opentrons.flex_wire import UNTESTED_HARDWARE_WARNING
@@ -51,6 +65,10 @@ if TYPE_CHECKING:
   from pylabrobot.opentrons.flex import OpentronsFlex
 
 logger = logging.getLogger(__name__)
+
+# What reconcile_tips_with_hardware can report; the matching RECONCILE_*
+# constants live with the other module constants below.
+TipReconcileOutcome = Literal["in_sync", "cleared_lost_tips", "untracked_tip_present", "unverified"]
 
 
 class _FlexHead:
@@ -84,11 +102,7 @@ class _FlexHead:
     # describing the head does not have to re-read /instruments to get it.
     self.max_volume = max_volume
     self._channel_tips: List[Optional[Tip]] = [None] * channels
-    self._untested_hardware_warned: bool = False
-    # The labware id the pipette last pipetted over, or None when its position is
-    # unknown (start of run, after a jog or a trash drop). Used to arc high only
-    # when a pipetting move crosses to a different slot -- see _travel_guard.
-    self._current_labware_id: Optional[str] = None
+    self._untested_hardware_warned: Set[str] = set()
 
   async def _travel_guard(self, params: Dict[str, Any]) -> None:
     """Arc to a new slot's well at the safe travel plane before pipetting there.
@@ -106,29 +120,40 @@ class _FlexHead:
     well_name = params.get("wellName")
     if not isinstance(labware_id, str) or not isinstance(well_name, str):
       return
-    if labware_id == self._current_labware_id:
+    if labware_id == self.flex._current_labware_id:
       return
-    await self._execute(
-      "moveToWell",
-      {
-        "pipetteId": self.pipette_id,
-        "labwareId": labware_id,
-        "wellName": well_name,
-        "wellLocation": {"origin": "top", "offset": {"x": 0, "y": 0, "z": 0}},
-        "minimumZHeight": self._traversal_height(),
-      },
-    )
-    self._current_labware_id = labware_id
+    async with self.flex._moving_to(labware_id):
+      await self._execute(
+        "moveToWell",
+        {
+          "pipetteId": self.pipette_id,
+          "labwareId": labware_id,
+          "wellName": well_name,
+          "wellLocation": {"origin": "top", "offset": {"x": 0, "y": 0, "z": 0}},
+          "minimumZHeight": self._traversal_height(),
+        },
+      )
+
+  async def _execute_at_well(self, command_type: str, params: Dict[str, Any]) -> None:
+    """Send a command that names a well, arcing high first when it crosses slots.
+
+    ``touchTip`` names a well but carries no ``minimumZHeight`` of its own, so
+    the crossing is only safe if the guard puts an arc in front of it. The
+    probes need the same guard but send through ``_execute_draw``.
+    """
+    await self._travel_guard(params)
+    await self._execute(command_type, params)
 
   def _warn_untested_hardware(self, op: str) -> None:
     """Log a one-time notice when an op has no real-hardware verification.
 
-    Coverage is op-scoped: ops in ``_HARDWARE_VERIFIED_OPS`` never log; the
-    first op outside that set logs once per instance.
+    Coverage is op-scoped: ops in ``_HARDWARE_VERIFIED_OPS`` never log, and
+    every other op logs once, so a run that touches several unverified ops
+    names all of them rather than only whichever ran first.
     """
-    if op in self._HARDWARE_VERIFIED_OPS or self._untested_hardware_warned:
+    if op in self._HARDWARE_VERIFIED_OPS or op in self._untested_hardware_warned:
       return
-    self._untested_hardware_warned = True
+    self._untested_hardware_warned.add(op)
     logger.warning(UNTESTED_HARDWARE_WARNING, type(self).__name__, op)
 
   def get_mounted_tips(self) -> List[Optional[Tip]]:
@@ -352,17 +377,15 @@ class _FlexHead:
       )
     return f"movableTrash{slot}"
 
-  async def _execute_trash_drop(self, trash: Trash) -> None:
-    """Send the two-command addressable-area trash-drop sequence.
+  async def _move_over_trash(self, trash: Trash, extra_z: float = 0.0) -> None:
+    """Travel to the trash's drop position, arcing over everything on the deck.
 
-    Shared by every ``discard_tips``/``drop_single_tip`` variant. No tracker
-    involvement (trash has none); callers update ``_channel_tips`` and call
-    ``_confirm_tips_cleared()`` themselves after this returns.
-
-    ``minimumZHeight`` is set to the computed traversal plane so the travel to
-    the trash arcs over every labware on the deck. Without it the engine picks
-    its own arc height from only the labware it has been told is loaded, which
-    can travel too low and clip a rack the robot was never told about.
+    ``minimumZHeight`` is the computed traversal plane, so the travel clears
+    every labware on the deck. Without it the engine picks its own arc height
+    from only the labware it has been told is loaded, which can travel too low
+    and clip a rack the robot was never told about. ``extra_z`` raises the
+    plane further for a tip the engine is not planning around (see
+    ``unsafe_discard_tips``).
     """
     await self._execute(
       "moveToAddressableAreaForDropTip",
@@ -370,12 +393,21 @@ class _FlexHead:
         "pipetteId": self.pipette_id,
         "addressableAreaName": self._trash_addressable_area(trash),
         "alternateDropLocation": True,
-        "minimumZHeight": self._traversal_height(),
+        "minimumZHeight": self._traversal_height() + extra_z,
       },
     )
-    await self._execute("dropTipInPlace", {"pipetteId": self.pipette_id})
-    # Now over the trash, not a slot's labware: the next pipetting move arcs high.
-    self._current_labware_id = None
+
+  async def _execute_trash_drop(self, trash: Trash) -> None:
+    """Send the two-command addressable-area trash-drop sequence.
+
+    Shared by every ``discard_tips``/``drop_single_tip`` variant. No tracker
+    involvement (trash has none); callers update ``_channel_tips`` and call
+    ``_confirm_tips_cleared()`` themselves after this returns.
+    """
+    # The trash is not a slot's labware, so the next pipetting move arcs high.
+    async with self.flex._moving_to(None):
+      await self._move_over_trash(trash)
+      await self._execute("dropTipInPlace", {"pipetteId": self.pipette_id})
 
   # --- Fine-pipetting shared helpers ---
 
@@ -499,18 +531,17 @@ class _FlexHead:
     deliberately does not prime for it, because reaching this state means the
     tip has held liquid and a probe wants a dry one.
     """
-    result = await self._execute_draw(
-      command_type,
-      {
-        "pipetteId": self.pipette_id,
-        "labwareId": labware_id,
-        "wellName": well_name,
-        "wellLocation": {
-          "origin": "top",
-          "offset": {"x": 0, "y": 0, "z": _LIQUID_PROBE_START_OFFSET_Z},
-        },
+    params: Dict[str, Any] = {
+      "pipetteId": self.pipette_id,
+      "labwareId": labware_id,
+      "wellName": well_name,
+      "wellLocation": {
+        "origin": "top",
+        "offset": {"x": 0, "y": 0, "z": _LIQUID_PROBE_START_OFFSET_Z},
       },
-    )
+    }
+    await self._travel_guard(params)
+    result = await self._execute_draw(command_type, params)
     return cast(Optional[float], result.get("result", {}).get("z_position"))
 
   async def _liquid_probe_z(self, labware_id: str, well_name: str, where: str) -> float:
@@ -729,10 +760,9 @@ class _FlexHead:
     }
     if speed is not None:
       params["speed"] = speed
-    await self._execute("moveToCoordinates", params)
-    # A raw jog leaves the pipette at an arbitrary point: the next pipetting move
-    # can no longer assume it is over its last labware, so make it arc high.
-    self._current_labware_id = None
+    # A raw jog ends at an arbitrary point, so the next pipetting move arcs high.
+    async with self.flex._moving_to(None):
+      await self._execute("moveToCoordinates", params)
 
   async def move_to_well(
     self,
@@ -771,7 +801,9 @@ class _FlexHead:
     }
     if speed is not None:
       params["speed"] = speed
-    await self._execute("moveToWell", params)
+    # The head ends over real labware, so pipetting there next crosses nothing.
+    async with self.flex._moving_to(labware_id):
+      await self._execute("moveToWell", params)
 
   async def move_relative(self, axis: str, distance: float) -> None:
     """Jog one axis by ``distance`` mm from wherever the head is now.
@@ -783,10 +815,12 @@ class _FlexHead:
     self._warn_untested_hardware("move_relative")
     if axis not in _MOVE_AXES:
       raise ValueError(f"axis must be one of {sorted(_MOVE_AXES)}, got {axis!r}")
-    await self._execute(
-      "moveRelative",
-      {"pipetteId": self.pipette_id, "axis": axis, "distance": distance},
-    )
+    # Same arbitrary end point as move_to: the next pipetting move arcs high.
+    async with self.flex._moving_to(None):
+      await self._execute(
+        "moveRelative",
+        {"pipetteId": self.pipette_id, "axis": axis, "distance": distance},
+      )
 
   async def move_to_addressable_area(
     self,
@@ -814,7 +848,9 @@ class _FlexHead:
     }
     if speed is not None:
       params["speed"] = speed
-    await self._execute("moveToAddressableArea", params)
+    # A deck fixture is not a slot's labware: the next pipetting move arcs high.
+    async with self.flex._moving_to(None):
+      await self._execute("moveToAddressableArea", params)
 
   # --- In-place pipetting (acts where the head already is) ---
 
@@ -913,6 +949,42 @@ class _FlexHead:
       {"pipetteId": self.pipette_id, "expectedState": expected_state},
     )
 
+  async def reconcile_tips_with_hardware(self) -> TipReconcileOutcome:
+    """Make this head's tip bookkeeping answer to the hardware sensor.
+
+    One sensor reading per mount (see ``has_tip_on_hardware``), no motion. The
+    only automatic repair is clearing: when the sensor reads absent while the
+    model holds tips, the tips are physically gone (typically an operator
+    recovered the robot at the instrument and dropped them there) and every
+    channel on this mount is cleared. Like ``unsafe_drop_tip_in_place``, the
+    cleared ``Tip`` objects return to no rack; their spots were already emptied
+    at pickup.
+
+    The opposite reading (present while the model holds none) is REPORTED,
+    never repaired: the sensor is one bool per mount, so nothing can say which
+    channel holds the tip or which tip it is, and guessing state into the
+    layer that computes travel heights is a crash, not a recovery. Discard the
+    tip physically (``unsafe_discard_tips``) instead of asserting it.
+
+    Returns:
+      ``RECONCILE_IN_SYNC``, ``RECONCILE_CLEARED_LOST_TIPS``,
+      ``RECONCILE_UNTRACKED_TIP`` or ``RECONCILE_UNVERIFIED`` (sensor read
+      unknown; nothing changed).
+    """
+    tracked = self._mounted_count()
+    sensor = await self.has_tip_on_hardware()
+    if sensor is None:
+      return RECONCILE_UNVERIFIED
+    if sensor and tracked == 0:
+      return RECONCILE_UNTRACKED_TIP
+    if not sensor and tracked > 0:
+      self._channel_tips = [None] * self.channels
+      # Whatever moved those tips moved the gantry too: the next pipetting
+      # move must arc rather than assume it is still over its last labware.
+      self.flex.forget_pipetting_position()
+      return RECONCILE_CLEARED_LOST_TIPS
+    return RECONCILE_IN_SYNC
+
   async def configure_for_volume(self, volume: float) -> None:
     """Put the pipette in the volume mode that suits ``volume`` uL.
 
@@ -934,10 +1006,35 @@ class _FlexHead:
     be, so move somewhere it can be retrieved from first. Clears this head's
     per-channel tip bookkeeping; no tip tracker is touched, since the tip
     goes back to no rack.
+
+    Deliberately does NOT require a tip in this head's own bookkeeping. That
+    model is per-process and empty after any restart, which is exactly when a
+    tip is stranded on the nozzle and this call is the way off. Guarding on it
+    made the escape hatch refuse in the only situation it exists for.
     """
     self._warn_untested_hardware("unsafe_drop_tip_in_place")
-    self._require_mounted_tip()
     await self._execute("unsafe/dropTipInPlace", {"pipetteId": self.pipette_id})
+    self._channel_tips = [None] * self.channels
+
+  async def unsafe_discard_tips(self, trash: Trash) -> None:
+    """Trash a tip the run does not know about. Reads no sensor of its own.
+
+    The recovery counterpart to ``discard_tips``, for the state
+    ``reconcile_tips_with_hardware`` reports as ``untracked_tip_present``: the
+    caller has already established a tip is seated, so this only has to get
+    rid of it. After an external recovery the fresh run believes no tip is
+    attached, so the ordinary drop is refused and, worse, the engine plans
+    travel for the bare NOZZLE while the physical tip bottom hangs up to a
+    large tip's length lower. Travel is therefore padded by the longest tip
+    this pipette mounts, and the drop is the checks-skipping
+    ``unsafe/dropTipInPlace``. Clears this head's per-channel bookkeeping;
+    like ``unsafe_drop_tip_in_place``, the tips return to no rack.
+    """
+    self._warn_untested_hardware("unsafe_discard_tips")
+    hang = _UNKNOWN_TIP_HANG_LARGE if self.max_volume >= 1000 else _UNKNOWN_TIP_HANG_SMALL
+    async with self.flex._moving_to(None):
+      await self._move_over_trash(trash, extra_z=hang)
+      await self._execute("unsafe/dropTipInPlace", {"pipetteId": self.pipette_id})
     self._channel_tips = [None] * self.channels
 
   async def unsafe_blow_out_in_place(self, flow_rate: float) -> None:
@@ -945,11 +1042,13 @@ class _FlexHead:
 
     The recovery counterpart to ``blow_out`` (see ``unsafe_drop_tip_in_place``
     for what "unsafe/" buys). ``flow_rate`` is in uL/s and has no default
-    here, the recovery path being an explicit one. Leaves the plunger past
+    here, the recovery path being an explicit one. Like
+    ``unsafe_drop_tip_in_place`` it does not consult this head's per-process
+    tip bookkeeping, which is empty after a restart and would refuse the very
+    recovery it exists for. Leaves the plunger past
     its dispense bottom, so the next draw needs priming.
     """
     self._warn_untested_hardware("unsafe_blow_out_in_place")
-    self._require_mounted_tip()
     await self._execute(
       "unsafe/blowOutInPlace",
       {"pipetteId": self.pipette_id, "flowRate": flow_rate},
@@ -977,6 +1076,18 @@ _NOT_PRIMED_REMEDY = (
 # "unknown", but that is a reading, not something to check against.
 _TIP_PRESENCE_STATES = frozenset({"present", "absent"})
 
+# Outcomes of reconcile_tips_with_hardware, public so consumers react by
+# constant rather than by string literal.
+RECONCILE_IN_SYNC: Final = "in_sync"
+RECONCILE_CLEARED_LOST_TIPS: Final = "cleared_lost_tips"
+RECONCILE_UNTRACKED_TIP: Final = "untracked_tip_present"
+RECONCILE_UNVERIFIED: Final = "unverified"
+
+# How far a tip the engine does not know about hangs below the nozzle it plans
+# for: Flex 1000 uL tips hang ~85 mm, 50/200 uL ~48. See unsafe_discard_tips.
+_UNKNOWN_TIP_HANG_LARGE = 86.0
+_UNKNOWN_TIP_HANG_SMALL = 49.0
+
 # The 8-channel head's rows front-to-back: channel 0 = "A" (rearmost) .. 7 = "H"
 # (frontmost). Used to name the corner nozzles of a partial (QUADRANT) column.
 _ROW_LETTERS = "ABCDEFGH"
@@ -984,6 +1095,10 @@ _ROW_LETTERS = "ABCDEFGH"
 # The only nozzles an 8-channel Flex can anchor a SINGLE layout on ("A1" is
 # the rearmost, "H1" the frontmost), mapped to the channel each one is.
 _SINGLE_NOZZLES = {"A1": 0, "H1": 7}
+
+# Anchoring the rear nozzle suits consuming a rack front-to-back: the idle seven
+# hang past the front edge the whole way up a column.
+_DEFAULT_SINGLE_NOZZLE = "A1"
 _SINGLE_NOZZLE_BY_CHANNEL = {channel: nozzle for nozzle, channel in _SINGLE_NOZZLES.items()}
 
 # Each anchor nozzle's y offset from the pipette mount, and the pipette body's own
@@ -1057,6 +1172,7 @@ class FlexHead1(_FlexHead):
       "air_gap_in_place",
       "aspirate",
       "aspirate_in_place",
+      "blow_out",
       "configure_for_volume",
       "dispense",
       "dispense_in_place",
@@ -1069,7 +1185,11 @@ class FlexHead1(_FlexHead):
       "move_to_well",
       "pick_up_tips",
       "position",
+      "prepare_to_aspirate",
+      "touch_tip",
       "try_liquid_probe",
+      "unsafe_blow_out_in_place",
+      "unsafe_drop_tip_in_place",
       "verify_tip_presence",
     }
   )
@@ -1229,29 +1349,30 @@ class FlexHead1(_FlexHead):
     self._warn_untested_hardware("touch_tip")
     self._require_mounted_tip()
     labware_id, well_name = await self._well_target(well)
-    await self._execute("touchTip", self._touch_tip_params(labware_id, well_name, radius, offset))
+    await self._execute_at_well(
+      "touchTip", self._touch_tip_params(labware_id, well_name, radius, offset)
+    )
 
-  async def liquid_probe(self, well: Well) -> float:
-    """Probe downward in ``well`` until the pressure sensor detects liquid; return its z (mm).
+  async def liquid_probe(self, target: Union[Well, Container]) -> float:
+    """Probe down in ``target`` until the pressure sensor finds liquid; return its z (mm).
 
-    One ``liquidProbe`` command naming ``well``. Requires a mounted tip
-    (checked before any wire command). Raises ``OpentronsError`` if no
-    liquid is found; use ``try_liquid_probe`` for the non-raising variant.
+    One ``liquidProbe`` command naming a well of a plate, or a bare
+    ``Container`` (trough/reservoir) at its own sole well. The z is in DECK
+    space, which is what the robot reports; ``well_bottom_deck_z`` is what turns
+    it into a height above the well floor. Requires a mounted tip (checked
+    before any wire command). Raises ``OpentronsError`` if no liquid is found;
+    use ``try_liquid_probe`` for the non-raising variant.
     """
     self._warn_untested_hardware("liquid_probe")
     self._require_mounted_tip()
-    parent = self._require_itemized_parent(well)
-    labware_id = await self.flex._ensure_labware_loaded(parent)
-    well_name = parent.get_child_identifier(well)
-    return await self._liquid_probe_z(labware_id, well_name, f"well {well.name!r}")
+    labware_id, well_name = await self._well_target(target)
+    return await self._liquid_probe_z(labware_id, well_name, f"{target.name!r}")
 
-  async def try_liquid_probe(self, well: Well) -> Optional[float]:
+  async def try_liquid_probe(self, target: Union[Well, Container]) -> Optional[float]:
     """Like ``liquid_probe`` but return ``None`` instead of raising when no liquid is found."""
     self._warn_untested_hardware("try_liquid_probe")
     self._require_mounted_tip()
-    parent = self._require_itemized_parent(well)
-    labware_id = await self.flex._ensure_labware_loaded(parent)
-    well_name = parent.get_child_identifier(well)
+    labware_id, well_name = await self._well_target(target)
     return await self._probe_z("tryLiquidProbe", labware_id, well_name)
 
 
@@ -1285,20 +1406,40 @@ class FlexHead8(_FlexHead):
   front four) layouts, and tip drop in the full-column and single-nozzle
   layouts, confirmed against the hardware tip-presence sensor; and
   aspirate/dispense into a plate in the full-column and single-nozzle layouts.
-  Ops outside that set -- container/reservoir ops, touch_tip, liquid_probe, and
-  the motion surface -- are coded but not yet hardware-verified and log the
-  one-time untested-hardware notice, same as the other heads.
+  ``_HARDWARE_VERIFIED_OPS`` is the full record: the notebook runs above cover
+  the tip and plate ops, and a Cheshire Labs bench session on the same head
+  covers the container, in-place, probe and recovery ops. What is left -- the
+  motion surface (``move_to``, ``move_relative``, ``position``,
+  ``move_to_addressable_area``), ``configure_for_volume``,
+  ``prepare_to_aspirate`` and ``verify_tip_presence`` -- is coded but not yet
+  hardware-verified and logs the untested-hardware notice, same as the other
+  heads.
   """
 
   _HARDWARE_VERIFIED_OPS: FrozenSet[str] = frozenset(
     {
-      "pick_up_tips",
-      "pick_up_single_tip",
-      "pick_up_partial",
-      "drop_tips",
-      "drop_single_tip",
+      "air_gap_in_place",
       "aspirate",
+      "aspirate_container",
+      "aspirate_in_place",
+      "aspirate_single",
+      "blow_out",
       "dispense",
+      "dispense_container",
+      "dispense_in_place",
+      "dispense_single",
+      "drop_single_tip",
+      "drop_tips",
+      "get_tip_presence",
+      "liquid_probe",
+      "move_to_well",
+      "pick_up_partial",
+      "pick_up_single_tip",
+      "pick_up_tips",
+      "touch_tip",
+      "try_liquid_probe",
+      "unsafe_blow_out_in_place",
+      "unsafe_drop_tip_in_place",
     }
   )
 
@@ -1313,8 +1454,24 @@ class FlexHead8(_FlexHead):
   ) -> None:
     super().__init__(flex, mount, pipette_id, channels, pipette_model, max_volume)
     self._nozzle_layout: str = "ALL"  # "ALL" | "SINGLE"
+    # The anchor the robot was actually SENT, not one merely computed here.
+    self._single_anchor: Optional[str] = None
 
   # --- Nozzle layout guard ---
+
+  async def _ensure_single_mode(self, nozzle: str) -> None:
+    """Put the robot on this anchor nozzle, sending the layout if it is not already.
+
+    Every single-nozzle op calls this rather than assuming the pickup's anchor
+    still stands. Which nozzle is primary decides which SIDE the seven idle
+    nozzles hang on, so an anchor the driver assumed but never transmitted
+    points them the opposite way from where its own clearance maths looked.
+    """
+    if self._nozzle_layout == "SINGLE" and self._single_anchor == nozzle:
+      return
+    await self._configure_nozzle_layout({"style": "SINGLE", "primaryNozzle": nozzle})
+    self._nozzle_layout = "SINGLE"
+    self._single_anchor = nozzle
 
   async def _ensure_all_mode(self) -> None:
     """Reset to the ALL nozzle layout before a column op.
@@ -1329,6 +1486,7 @@ class FlexHead8(_FlexHead):
       return
     await self._configure_nozzle_layout({"style": "ALL"})
     self._nozzle_layout = "ALL"
+    self._single_anchor = None
 
   # --- Column helpers ---
 
@@ -1438,7 +1596,10 @@ class FlexHead8(_FlexHead):
         )
       primary_nozzle = resolved
     await self.pick_up_single_tip(
-      cast(TipRack, parent), well_name, offset=offset, primary_nozzle=primary_nozzle
+      cast(TipRack, parent),
+      well_name,
+      offset=offset,
+      primary_nozzle=primary_nozzle if primary_nozzle is not None else _DEFAULT_SINGLE_NOZZLE,
     )
 
   async def _pick_up_spots(
@@ -2079,11 +2240,16 @@ class FlexHead8(_FlexHead):
     well_name, _ = self._column_anchor_and_items(plate, column)
     await self._ensure_all_mode()
     labware_id = await self.flex._ensure_labware_loaded(plate)
-    await self._execute("touchTip", self._touch_tip_params(labware_id, well_name, radius, offset))
+    await self._execute_at_well(
+      "touchTip", self._touch_tip_params(labware_id, well_name, radius, offset)
+    )
 
   async def liquid_probe(self, plate: Plate, column: int) -> float:
     """Probe for liquid in a column -- one ``liquidProbe`` command anchored at
-    its rearmost well; return the found liquid z (mm).
+    its rearmost well; return the found liquid z (mm), in deck space.
+
+    One command, so one reading for the whole column: the head reads its
+    pressure sensors together rather than per nozzle.
 
     Requires at least one mounted tip and a valid column (both checked
     before any wire command) and ALL nozzle mode (reset first if a
@@ -2106,6 +2272,29 @@ class FlexHead8(_FlexHead):
     await self._ensure_all_mode()
     labware_id = await self.flex._ensure_labware_loaded(plate)
     return await self._probe_z("tryLiquidProbe", labware_id, well_name)
+
+  async def liquid_probe_container(self, container: Container) -> float:
+    """Probe a single-cavity container -- one ``liquidProbe`` at its sole well.
+
+    Mirrors ``aspirate_container``: all nozzles share the one cavity, so one
+    command reads it. Returns the found liquid z in deck space. Requires a
+    mounted tip and ALL nozzle mode.
+    """
+    self._warn_untested_hardware("liquid_probe_container")
+    self._require_mounted_tip()
+    self._require_span_fits_container(container, 0.0, _EIGHT_CHANNEL_Y_SPAN, None)
+    await self._ensure_all_mode()
+    labware_id = await self.flex._ensure_labware_loaded(container)
+    return await self._liquid_probe_z(labware_id, _CONTAINER_WELL_NAME, f"{container.name!r}")
+
+  async def try_liquid_probe_container(self, container: Container) -> Optional[float]:
+    """Like ``liquid_probe_container`` but returns ``None`` when no liquid is found."""
+    self._warn_untested_hardware("try_liquid_probe_container")
+    self._require_mounted_tip()
+    self._require_span_fits_container(container, 0.0, _EIGHT_CHANNEL_Y_SPAN, None)
+    await self._ensure_all_mode()
+    labware_id = await self.flex._ensure_labware_loaded(container)
+    return await self._probe_z("tryLiquidProbe", labware_id, _CONTAINER_WELL_NAME)
 
   # --- Single-tip cherry-pick ---
 
@@ -2142,40 +2331,92 @@ class FlexHead8(_FlexHead):
     )
 
   @classmethod
-  def _anchor_for(cls, labware: ItemizedResource, well: str, primary_nozzle: Optional[str]) -> str:
-    """Settle which nozzle a single-tip op anchors on, refusing what cannot reach.
+  def _spots_under_idle_nozzles(
+    cls, labware: ItemizedResource, well: str, nozzle: str
+  ) -> List[Any]:
+    """The labware positions the SEVEN idle nozzles sit over, anchored this way.
 
-    A caller's explicit choice is never silently swapped -- an unreachable one
-    is refused, naming the nozzle that would work. Left to us, the well's own
-    row wins when it can reach (least surprise: the tip lands on the channel
-    whose row was asked for), otherwise whichever end reaches.
+    The nozzles are ganged: they cannot move relative to each other and they
+    always descend together, so every one of them engages whatever is beneath
+    it. A "single" pickup is only single because the other seven have nothing
+    under them. Positions past the labware's own edge are simply absent from
+    the result, which is the case that makes a pick safe.
     """
-    reachable = cls.reachable_single_nozzles(labware, well)
-    if primary_nozzle is not None:
-      if primary_nozzle not in _SINGLE_NOZZLES:
-        raise ValueError(
-          f"primary_nozzle={primary_nozzle!r}: an 8-channel Flex can anchor a single-nozzle "
-          f"layout only on {' or '.join(_SINGLE_NOZZLES)}."
-        )
-      if primary_nozzle not in reachable:
-        alternative = (
-          f" Anchor on {reachable[0]} instead."
-          if reachable
-          else " Neither anchor reaches it; move the labware to another slot."
-        )
-        raise ValueError(
-          f"Anchoring the {primary_nozzle} nozzle over '{labware.name}' well '{well}' would "
-          f"carry the pipette outside the robot's reach.{alternative}"
-        )
-      return primary_nozzle
-    if not reachable:
+    rows = labware.num_items_y
+    stride = max(rows // _NUM_CHANNELS, 1)
+    items = labware.get_all_items()
+    target = labware.get_item(well)
+    index = items.index(target)
+    column, row = divmod(index, rows)
+    anchor_channel = _SINGLE_NOZZLES[nozzle]
+
+    under: List[Any] = []
+    for channel in range(_NUM_CHANNELS):
+      if channel == anchor_channel:
+        continue
+      other_row = row + (channel - anchor_channel) * stride
+      if 0 <= other_row < rows:
+        under.append(items[column * rows + other_row])
+    return under
+
+  @classmethod
+  def _idle_nozzles_are_clear(cls, labware: ItemizedResource, well: str, nozzle: str) -> bool:
+    """Whether anchoring here leaves the seven idle nozzles over empty positions."""
+    return not any(spot.has_tip() for spot in cls._spots_under_idle_nozzles(labware, well, nozzle))
+
+  @classmethod
+  def _validate_single_anchor(cls, labware: ItemizedResource, well: str, nozzle: str) -> None:
+    """Refuse an anchor that cannot reach the well, or that would take more than one tip.
+
+    Which nozzle carries the tip fixes where the idle seven hang for the rest of
+    that tip's life, so it stays the caller's choice and is never swapped for
+    another one here. Clearance reads the tip trackers, so it is only checked
+    while tip tracking is on: with it off nothing maintains rack contents and
+    every position reads as full forever.
+    """
+    if nozzle not in _SINGLE_NOZZLES:
       raise ValueError(
-        f"'{labware.name}' well '{well}' is out of reach of both single-nozzle anchors "
-        f"({' and '.join(_SINGLE_NOZZLES)}); the pipette would leave the robot's extents "
-        f"either way. Move the labware to another slot."
+        f"primary_nozzle={nozzle!r}: an 8-channel Flex can anchor a single-nozzle "
+        f"layout only on {' or '.join(_SINGLE_NOZZLES)}."
       )
-    row_nozzle = f"{well[:1].upper()}1"
-    return row_nozzle if row_nozzle in reachable else reachable[0]
+    reachable = cls.reachable_single_nozzles(labware, well)
+    if nozzle not in reachable:
+      alternative = (
+        f" Anchor on {reachable[0]} instead."
+        if reachable
+        else " Neither anchor reaches it; move the labware to another slot."
+      )
+      raise ValueError(
+        f"Anchoring the {nozzle} nozzle over '{labware.name}' well '{well}' would "
+        f"carry the pipette outside the robot's reach.{alternative}"
+      )
+    if not does_tip_tracking() or cls._idle_nozzles_are_clear(labware, well, nozzle):
+      return
+    other = next(n for n in _SINGLE_NOZZLES if n != nozzle)
+    alternative = (
+      f" Anchor on {other} to hang them off the opposite edge."
+      if other in reachable and cls._idle_nozzles_are_clear(labware, well, other)
+      else " Pick a position whose neighbours along the column are already empty, or use "
+      "pick_up_tips for the whole column."
+    )
+    raise ValueError(
+      f"Anchoring the {nozzle} nozzle on '{labware.name}' well '{well}' would take more than "
+      f"one tip: the 8 nozzles are ganged and descend together, and the idle seven sit over "
+      f"positions that still hold tips.{alternative}"
+    )
+
+  async def _ensure_anchored_on_mounted_channel(self) -> None:
+    """Anchor the robot on the nozzle that is actually carrying the tip.
+
+    The tip sits on one physical channel and every later single-nozzle op has
+    to be driven from that same one. Recomputing an anchor per call and not
+    sending it leaves the robot on the pickup's nozzle while this side reasons
+    about a different one, which flips which side the seven idle nozzles hang
+    on without anything saying so.
+    """
+    nozzle = _SINGLE_NOZZLE_BY_CHANNEL.get(self._active_single_channel())
+    if nozzle is not None:
+      await self._ensure_single_mode(nozzle)
 
   def _require_reach_in_single_layout(self, labware: ItemizedResource, well: str) -> None:
     """Refuse a single-nozzle move to a well the mounted anchor cannot reach.
@@ -2214,24 +2455,24 @@ class FlexHead8(_FlexHead):
     tip_rack: TipRack,
     well: str,
     offset: Optional[Coordinate] = None,
-    primary_nozzle: Optional[str] = None,
+    primary_nozzle: str = _DEFAULT_SINGLE_NOZZLE,
   ) -> None:
-    """Pick up one tip in SINGLE nozzle mode.
+    """Pick up one tip in SINGLE nozzle mode, anchored on ``primary_nozzle``.
 
     Switches to SINGLE layout (``configureNozzleLayout``) before the
-    ``pickUpTip`` command. In that layout the pipette drives ONE nozzle and
-    the engine moves it over whatever well is named, so the nozzle, not the
-    well, decides which channel ends up holding the tip. An 8-channel Flex
-    can anchor on its "A1" or "H1" nozzle only; ``primary_nozzle`` picks
-    between them, and left unset it is the well's own row when that end can
-    reach the rack's slot, otherwise the end that can (see
-    ``reachable_single_nozzles``). Raises ``OpentronsError`` if that channel
-    already holds a tip -- checked, like the nozzle itself, before any wire
-    command. Then stage -> validate -> wire -> verify -> commit/rollback, as
-    in ``pick_up_tips``.
+    ``pickUpTip`` command. The eight nozzles are ganged, so a pick is only
+    "single" because the idle seven have nothing under them: the anchor, not
+    the well, decides what the pick does and which channel ends up holding the
+    tip. ``primary_nozzle`` names a nozzle -- "A1" is the rear one, "H1" the
+    front, and an 8-channel Flex anchors on those two only. It defaults to
+    "A1", which suits consuming a rack front-to-back: the idle seven hang past
+    the front edge the whole way up a column. Refused before any wire command
+    if the anchor cannot reach the well's slot, if it would take more than one
+    tip, or if its channel already holds one. Then stage -> validate -> wire ->
+    verify -> commit/rollback, as in ``pick_up_tips``.
     """
     self._warn_untested_hardware("pick_up_single_tip")
-    primary_nozzle = self._anchor_for(tip_rack, well, primary_nozzle)
+    self._validate_single_anchor(tip_rack, well, primary_nozzle)
     # The anchor only settles that the pipette stays inside the robot. The 7
     # idle nozzles still hang over the neighbouring slot, which is a crash.
     slot = self.flex.deck.get_slot(tip_rack)
@@ -2244,8 +2485,7 @@ class FlexHead8(_FlexHead):
         f"Channel {channel} already holds a tip; drop it before picking up another.",
       )
 
-    await self._configure_nozzle_layout({"style": "SINGLE", "primaryNozzle": primary_nozzle})
-    self._nozzle_layout = "SINGLE"
+    await self._ensure_single_mode(primary_nozzle)
 
     labware_id = await self.flex._ensure_labware_loaded(tip_rack)
     params: Dict[str, Any] = {
@@ -2274,6 +2514,7 @@ class FlexHead8(_FlexHead):
     well: str,
     volume: float,
     flow_rate: Optional[float] = None,
+    liquid_height: Optional[float] = None,
   ) -> None:
     """Aspirate a single well with the currently mounted single tip.
 
@@ -2282,13 +2523,13 @@ class FlexHead8(_FlexHead):
     to the robot for the same reason.
     """
     self._warn_untested_hardware("aspirate_single")
-    self._active_single_channel()
+    await self._ensure_anchored_on_mounted_channel()
     self._require_reach_in_single_layout(plate, well)
     self._require_single_nozzle_clearance(plate)
     labware_id = await self.flex._ensure_labware_loaded(plate)
     staged_trackers = self._stage_container_aspirate(plate.get_item(well), volume)
     await self._pipette(
-      "aspirate", labware_id, well, volume, flow_rate, None, None, staged_trackers
+      "aspirate", labware_id, well, volume, flow_rate, None, liquid_height, staged_trackers
     )
 
   async def dispense_single(
@@ -2297,17 +2538,41 @@ class FlexHead8(_FlexHead):
     well: str,
     volume: float,
     flow_rate: Optional[float] = None,
+    liquid_height: Optional[float] = None,
   ) -> None:
     """Dispense to a single well with the currently mounted single tip."""
     self._warn_untested_hardware("dispense_single")
-    self._active_single_channel()
+    await self._ensure_anchored_on_mounted_channel()
     self._require_reach_in_single_layout(plate, well)
     self._require_single_nozzle_clearance(plate)
     labware_id = await self.flex._ensure_labware_loaded(plate)
     staged_trackers = self._stage_container_dispense(plate.get_item(well), volume)
     await self._pipette(
-      "dispense", labware_id, well, volume, flow_rate, None, None, staged_trackers
+      "dispense", labware_id, well, volume, flow_rate, None, liquid_height, staged_trackers
     )
+
+  async def liquid_probe_single(self, plate: Plate, well: str) -> float:
+    """Probe one well with the currently mounted single tip; return its liquid z (mm).
+
+    The column ``liquid_probe`` cannot serve a cherry-pick: it resets the head
+    to ALL nozzle mode, which is refused while a tip is mounted. Same
+    single-layout reach and clearance rules as ``aspirate_single``.
+    """
+    self._warn_untested_hardware("liquid_probe_single")
+    await self._ensure_anchored_on_mounted_channel()
+    self._require_reach_in_single_layout(plate, well)
+    self._require_single_nozzle_clearance(plate)
+    labware_id = await self.flex._ensure_labware_loaded(plate)
+    return await self._liquid_probe_z(labware_id, well, f"well {well!r} of {plate.name!r}")
+
+  async def try_liquid_probe_single(self, plate: Plate, well: str) -> Optional[float]:
+    """Like ``liquid_probe_single`` but returns ``None`` when no liquid is found."""
+    self._warn_untested_hardware("try_liquid_probe_single")
+    await self._ensure_anchored_on_mounted_channel()
+    self._require_reach_in_single_layout(plate, well)
+    self._require_single_nozzle_clearance(plate)
+    labware_id = await self.flex._ensure_labware_loaded(plate)
+    return await self._probe_z("tryLiquidProbe", labware_id, well)
 
   async def drop_single_tip(self, trash: Trash) -> None:
     """Drop the single mounted tip to trash and restore ALL nozzle mode.
@@ -2318,6 +2583,7 @@ class FlexHead8(_FlexHead):
     """
     self._warn_untested_hardware("drop_single_tip")
     channel = self._active_single_channel()
+    await self._ensure_anchored_on_mounted_channel()
     await self._execute_trash_drop(trash)
     self._channel_tips[channel] = None
     await self._confirm_tips_cleared()
@@ -2347,8 +2613,8 @@ class FlexHead96(_FlexHead):
 
   Coded but **not yet verified on real 96-channel Flex hardware** --
   Vincent's bench Flex carries an 8-channel pipette, not a 96-channel head.
-  A one-time ``logger.warning`` fires on the first op issued by an instance,
-  and this docstring makes no "validated on hardware" claim.
+  Every op logs the one-time untested-hardware notice the first time an
+  instance issues it, and this docstring makes no "validated on hardware" claim.
   """
 
   # The Flex API's anchor well for 96-channel ALL-mode whole-plate ops; the
@@ -2553,6 +2819,6 @@ class FlexHead96(_FlexHead):
     self._require_mounted_tip()
     self._check_full_coverage(plate)
     labware_id = await self.flex._ensure_labware_loaded(plate)
-    await self._execute(
+    await self._execute_at_well(
       "touchTip", self._touch_tip_params(labware_id, self._ANCHOR_WELL_NAME, radius, offset)
     )

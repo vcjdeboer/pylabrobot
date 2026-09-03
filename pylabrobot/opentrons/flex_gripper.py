@@ -16,7 +16,7 @@ the robot's own for official load names, or the uploaded custom definition
 """
 
 import logging
-from typing import TYPE_CHECKING, Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, FrozenSet, Optional, Set
 
 from pylabrobot.opentrons.flex_wire import (
   UNTESTED_HARDWARE_WARNING,
@@ -49,18 +49,37 @@ class FlexGripper:
   The Flex gripper has NO rotation capability (a hardware limitation, not a
   missing API): labware keeps its orientation through every gripper motion,
   so a plate cannot be re-oriented between slots.
+
+  Every op here has been run on a real Flex gripper: jaw open/close/release,
+  a free-space move on the extension mount, and carrying a plate between deck
+  slots. The notice mechanism stays so an op added later is untested by
+  default, the same as on the heads.
   """
+
+  _HARDWARE_VERIFIED_OPS: FrozenSet[str] = frozenset(
+    {
+      "grip",
+      "move_labware",
+      "move_to",
+      "open_jaw",
+      "ungrip",
+    }
+  )
 
   def __init__(self, flex: "OpentronsFlex", gripper_model: str) -> None:
     self.flex = flex
     self.gripper_model = gripper_model
-    self._untested_hardware_warned: bool = False
+    self._untested_hardware_warned: Set[str] = set()
 
   def _warn_untested_hardware(self, op: str) -> None:
-    """Log a one-time notice that gripper ops are not yet verified on real hardware."""
-    if self._untested_hardware_warned:
+    """Log a one-time notice when an op has no real-hardware verification.
+
+    Coverage is op-scoped, the same as on the heads: ops in
+    ``_HARDWARE_VERIFIED_OPS`` never log, and every other op logs once.
+    """
+    if op in self._HARDWARE_VERIFIED_OPS or op in self._untested_hardware_warned:
       return
-    self._untested_hardware_warned = True
+    self._untested_hardware_warned.add(op)
     logger.warning(UNTESTED_HARDWARE_WARNING, type(self).__name__, op)
 
   async def move_labware(
@@ -125,15 +144,19 @@ class FlexGripper:
     labware_id = await self.flex._ensure_labware_loaded(
       resource, allow_stub=True, grip_distance_from_top=grip_distance_from_top
     )
-    await self.flex._execute_command(
-      "moveLabware",
-      {
-        "labwareId": labware_id,
-        "newLocation": slot_wire_location(to_slot),
-        "strategy": "usingGripper",
-      },
-      timeout=_MOVE_LABWARE_TIMEOUT,
-    )
+    # The gripper rides the same x/y gantry as the pipettes, and this moves
+    # the labware itself, so no pipetting position survives it.
+    async with self.flex._moving_to(None):
+      result = await self.flex._execute_command(
+        "moveLabware",
+        {
+          "labwareId": labware_id,
+          "newLocation": slot_wire_location(to_slot),
+          "strategy": "usingGripper",
+        },
+        timeout=_MOVE_LABWARE_TIMEOUT,
+      )
+    self.flex._note_labware_offset(name, result)
 
     deck.unassign_child_at_slot(from_slot)
     deck.assign_child_at_slot(resource, to_slot)
@@ -168,7 +191,9 @@ class FlexGripper:
     params: Dict[str, Any] = {"mount": "extension", "destination": {"x": x, "y": y, "z": z}}
     if speed is not None:
       params["speed"] = speed
-    await self.flex._execute_command("robot/moveTo", params)
+    # One gantry: driving the gripper across the deck moves the pipettes too.
+    async with self.flex._moving_to(None):
+      await self.flex._execute_command("robot/moveTo", params)
 
   async def grip(self, force: Optional[float] = None) -> None:
     """Close the gripper jaw around whatever sits between its paddles.

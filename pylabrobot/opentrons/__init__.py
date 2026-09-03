@@ -5,6 +5,7 @@ from pylabrobot.opentrons.robot import (
   OpentronsCommandError,
   OpentronsError,
   OpentronsRobot,
+  OpentronsRunNotCurrentError,
   PipetteInfo,
 )
 from pylabrobot.opentrons.transport import (
@@ -26,6 +27,7 @@ __all__ = [
   "OpentronsError",
   "OpentronsFlex",
   "OpentronsRobot",
+  "OpentronsRunNotCurrentError",
   "OpentronsTransport",
   "PipetteInfo",
 ]

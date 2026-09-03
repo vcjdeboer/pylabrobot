@@ -77,7 +77,7 @@ def _version_tuple(version: str) -> Tuple[int, ...]:
       break
     parts.append(int(digits))
   if not parts:
-    raise ValueError(f"unparseable version string: {version!r}")
+    raise ValueError(f"unparsable version string: {version!r}")
   while len(parts) < 3:
     parts.append(0)
   return tuple(parts)
@@ -95,7 +95,7 @@ def _require_robot_commands(command: str, api_version: Optional[str]) -> None:
   robot-server) and runs current code, so it passes -- but a build cut off a
   real tag reports that tag plus a dev suffix ("8.1.0.dev5"), which is gated
   on the tag like any release. ``ChatterboxTransport``'s offline "dry-run"
-  sentinel passes too; it reaches no robot at all. Any other unparseable
+  sentinel passes too; it reaches no robot at all. Any other unparsable
   version raises rather than silently passing the gate.
   """
   if api_version is None:

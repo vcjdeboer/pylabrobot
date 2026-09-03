@@ -3,7 +3,7 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, cast
+from typing import Any, Dict, List, NoReturn, Optional, cast
 
 from pylabrobot.opentrons.transport import HttpxTransport, OpentronsTransport
 
@@ -11,6 +11,25 @@ logger = logging.getLogger(__name__)
 
 # Seconds of polling a command gets on top of however long its own motion takes.
 COMMAND_POLL_HEADROOM = 30.0
+
+# Delay between two reads of a running command's status.
+COMMAND_STATUS_POLL_INTERVAL = 0.2
+
+# Run statuses that accept no further commands: a run on its way down refuses
+# new work the same as one already stopped.
+_TERMINAL_RUN_STATUSES = frozenset(
+  {"stopped", "failed", "succeeded", "stop-requested", "finishing"}
+)
+
+
+def _robot_says_run_is_gone(error: Exception) -> bool:
+  """Whether a wire failure was the robot answering 404 for the run.
+
+  Read off the status rather than the exception type: the real transport
+  raises httpx's error and the offline fake raises its own, and both carry the
+  status the same way.
+  """
+  return getattr(getattr(error, "response", None), "status_code", None) == 404
 
 
 def _plunger_seconds(params: Dict[str, Any]) -> float:
@@ -26,10 +45,39 @@ def _plunger_seconds(params: Dict[str, Any]) -> float:
   return abs(volume) / flow_rate if flow_rate > 0 else 0.0
 
 
+def _command_budget(timeout: float, params: Dict[str, Any]) -> float:
+  """How long one command may be polled: its own budget, raised only by the plunger
+  travel it names. Not a floor, or no caller could ever set a short budget."""
+  motion = _plunger_seconds(params)
+  return max(timeout, motion + COMMAND_POLL_HEADROOM) if motion > 0 else timeout
+
+
 class OpentronsError(Exception):
   def __init__(self, title: str, message: Optional[str] = None) -> None:
     self.title, self.message = title, message
     super().__init__(f"{title}: {message}" if message else title)
+
+
+class OpentronsRunNotCurrentError(OpentronsError):
+  """The robot no longer holds the run this object opened.
+
+  The touchscreen only works while no run is current, so an operator recovering
+  the robot at the instrument stops our run before anything else. Every
+  run-scoped identity (pipette ids, labware ids, uploaded definitions, the
+  engine's tip record) died with it, which is why this is its own type rather
+  than a generic wire failure: the remedy is not a retry but a session rebuild
+  (``create_run()`` then ``initialize()``), after which tip bookkeeping must be
+  reconciled against the hardware sensor.
+  """
+
+  def __init__(self, run_id: Optional[str]) -> None:
+    super().__init__(
+      "Run no longer current",
+      f"run {run_id!r} is not the robot's current run (an operator likely took the "
+      "robot at the instrument). Rebuild the session with create_run() + initialize(), "
+      "then reconcile tip state against the hardware sensor.",
+    )
+    self.run_id = run_id
 
 
 class OpentronsCommandError(RuntimeError):
@@ -81,6 +129,13 @@ class OpentronsRobot(abc.ABC):
     port: int = 31950,
     transport: Optional[OpentronsTransport] = None,
   ) -> None:
+    """Build a robot handle. Nothing is contacted until ``setup()``.
+
+    Args:
+      host: the robot's address.
+      port: the robot-server's port.
+      transport: wire transport to use instead of a real one, for offline runs.
+    """
     self.host, self.port = host, port
     self.base_url = f"http://{host}:{port}"
     # Built here rather than on connect: a pylabrobot io refuses construction
@@ -253,6 +308,52 @@ class OpentronsRobot(abc.ABC):
     logger.info("Created run %s", self.run_id)
     return run_id
 
+  async def run_is_live(self) -> bool:
+    """Whether the run this object opened still accepts commands.
+
+    One ``GET /runs/{id}``, no motion. ``False`` with no run open, ``False``
+    when the robot no longer has the run at all (404: it was deleted), and
+    ``False`` when the robot reports it superseded or in a terminal status.
+    All three matter: the robot-server clears ``current`` only when a run is
+    deleted or another run supersedes it -- an operator who merely STOPS our
+    run at the touchscreen leaves it stopped-but-still-current, so ``current``
+    alone would read a dead run as live. Any OTHER wire failure propagates
+    rather than being read as dead, so an unreachable robot is not mistaken
+    for a taken-over one.
+    """
+    if self.run_id is None:
+      return False
+    try:
+      run = (await self._get(f"/runs/{self.run_id}")).get("data", {})
+    except Exception as error:
+      if _robot_says_run_is_gone(error):
+        return False
+      raise
+    if not run.get("current", False):
+      return False
+    return run.get("status") not in _TERMINAL_RUN_STATUSES
+
+  async def _reraise_run_aware(self, wire_error: Exception) -> NoReturn:
+    """Re-raise a run-scoped wire failure, typed when the run died under us.
+
+    The robot-server refuses requests against a dead run at the HTTP layer,
+    whose error carries no type a caller can react to. One liveness read
+    classifies it; when that read itself fails, or no run was open to begin
+    with (nothing external can have killed it), the original error stands, so
+    an unreachable robot keeps its own failure rather than a wrong "run died"
+    story.
+    """
+    run_id = self.run_id
+    if run_id is None:
+      raise wire_error
+    try:
+      alive = await self.run_is_live()
+    except Exception:
+      raise wire_error
+    if not alive:
+      raise OpentronsRunNotCurrentError(run_id) from wire_error
+    raise wire_error
+
   async def _cancel_run(self) -> None:
     """Cancel the current run. Safe to call if no run is active."""
     if self.run_id is None:
@@ -299,7 +400,7 @@ class OpentronsRobot(abc.ABC):
       RuntimeError: If the command times out.
     """
     assert self.run_id is not None, "No active run. Call create_run() first."
-    timeout = max(timeout, _plunger_seconds(params) + COMMAND_POLL_HEADROOM)
+    timeout = _command_budget(timeout, params)
     payload = {
       "data": {
         "commandType": command_type,
@@ -307,7 +408,10 @@ class OpentronsRobot(abc.ABC):
         "intent": "setup",
       }
     }
-    result = await self._post(f"/runs/{self.run_id}/commands", payload)
+    try:
+      result = await self._post(f"/runs/{self.run_id}/commands", payload)
+    except Exception as wire_error:
+      await self._reraise_run_aware(wire_error)
     cmd_data: Dict[str, Any] = result.get("data", {})
 
     if not wait:
@@ -317,19 +421,24 @@ class OpentronsRobot(abc.ABC):
     if not cmd_id:
       return cmd_data
 
-    # Poll for completion
+    # Status is read once more after the deadline passes: a command that finished
+    # during the last sleep succeeded, and calling that a timeout aborts a real move.
     deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-      resp = await self._get(f"/runs/{self.run_id}/commands/{cmd_id}")
+    while True:
+      try:
+        resp = await self._get(f"/runs/{self.run_id}/commands/{cmd_id}")
+      except Exception as wire_error:
+        await self._reraise_run_aware(wire_error)
       cmd_data = resp.get("data", {})
       status = cmd_data.get("status", "")
       if status == "succeeded":
         return cmd_data
-      elif status == "failed":
+      if status == "failed":
         raise OpentronsCommandError(command_type, cmd_data.get("error", {}))
-      await asyncio.sleep(0.2)
-
-    raise RuntimeError(f"Opentrons command '{command_type}' timed out after {timeout}s")
+      remaining = deadline - time.monotonic()
+      if remaining <= 0:
+        raise RuntimeError(f"Opentrons command '{command_type}' timed out after {timeout}s")
+      await asyncio.sleep(min(COMMAND_STATUS_POLL_INTERVAL, remaining))
 
   # --- Instrument Discovery ---
 

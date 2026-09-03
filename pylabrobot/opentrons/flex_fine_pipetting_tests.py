@@ -26,6 +26,7 @@ import unittest
 from typing import Any, Dict, Optional
 
 from pylabrobot.opentrons.flex import OpentronsFlex
+from pylabrobot.opentrons.flex_container_tests import _make_trough
 from pylabrobot.opentrons.flex_head import FlexHead1
 from pylabrobot.opentrons.flex_tests import _flex_head1, _flex_head8, _flex_head96
 from pylabrobot.opentrons.robot import OpentronsCommandError, OpentronsError
@@ -354,6 +355,34 @@ class TestTouchTipHead96(unittest.TestCase):
       asyncio.run(flex.stop())
 
 
+# Definitions a simulated robot answers loads with. The numbers are this fixture's,
+# deliberately not any real vendor's: what is under test is that the driver reports
+# the floor the RUN stated, so a value that matched PyLabRobot's own geometry would
+# pass whether or not the run was consulted.
+_CORNING_FLAT = "corning_96_wellplate_360ul_flat"
+_CORNING_WELL_FLOOR_Z = 3.552
+_NEST_RESERVOIR = "nest_1_reservoir_195ml"
+_NEST_FLOOR_Z = 2.31
+_ROBOT_DEFINITIONS: Dict[str, Dict[str, Any]] = {
+  _NEST_RESERVOIR: {
+    "parameters": {"loadName": _NEST_RESERVOIR},
+    "schemaVersion": 2,
+    "cornerOffsetFromSlot": {"x": 0, "y": 0, "z": 0},
+    "wells": {"A1": {"z": _NEST_FLOOR_Z, "depth": 25.0}},
+  },
+  _CORNING_FLAT: {
+    "parameters": {"loadName": _CORNING_FLAT},
+    "schemaVersion": 2,
+    "cornerOffsetFromSlot": {"x": 0, "y": 0, "z": 0},
+    "wells": {
+      f"{row}{col}": {"z": _CORNING_WELL_FLOOR_Z, "depth": 10.668}
+      for row in "ABCDEFGH"
+      for col in range(1, 13)
+    },
+  },
+}
+
+
 class TestLiquidProbeHead1(unittest.TestCase):
   """FlexHead1 liquid probing: the found liquid z rides the command result's
   ``z_position`` key, which the robot-server OMITS entirely (not null) when
@@ -369,6 +398,7 @@ class TestLiquidProbeHead1(unittest.TestCase):
     set_volume_tracking(False)
 
   def _bench(self, **transport_kwargs):
+    transport_kwargs.setdefault("robot_labware_definitions", _ROBOT_DEFINITIONS)
     flex, transport, head = _flex_head1(**transport_kwargs)
     rack = flex_96_tiprack_50ul(name="rack1")
     plate = cor_96_wellplate_360uL_Fb(name="plate1")
@@ -377,7 +407,7 @@ class TestLiquidProbeHead1(unittest.TestCase):
     flex.deck.assign_child_at_slot(plate, "C2")
     return flex, transport, head, rack, plate
 
-  def test_liquid_probe_returns_configured_z_and_sends_probe_command(self):
+  def test_liquid_probe_reports_the_deck_z_the_robot_answered(self):
     flex, transport, head, rack, plate = self._bench(liquid_probe_z=12.5)
     try:
       asyncio.run(head.pick_up_tips(rack.get_item("A1")))
@@ -423,7 +453,7 @@ class TestLiquidProbeHead1(unittest.TestCase):
     finally:
       asyncio.run(flex.stop())
 
-  def test_try_liquid_probe_returns_configured_z(self):
+  def test_try_liquid_probe_reports_the_deck_z_the_robot_answered(self):
     flex, transport, head, rack, plate = self._bench(liquid_probe_z=4.75)
     try:
       asyncio.run(head.pick_up_tips(rack.get_item("A1")))
@@ -560,6 +590,7 @@ class TestLiquidProbeHead8(unittest.TestCase):
     set_volume_tracking(False)
 
   def _bench(self, **transport_kwargs):
+    transport_kwargs.setdefault("robot_labware_definitions", _ROBOT_DEFINITIONS)
     flex, transport, head = _flex_head8(**transport_kwargs)
     rack = flex_96_tiprack_50ul(name="rack")
     plate = cor_96_wellplate_360uL_Fb(name="plate")
@@ -869,41 +900,89 @@ class TestSingleNozzleLayout(unittest.TestCase):
       if c["commandType"] == "configureNozzleLayout"
     ]
 
-  def test_a_middle_row_well_anchors_on_a_nozzle_that_can_reach_it(self):
-    # The row letter names no anchor ("C1" is not a primaryNozzle the
-    # robot-server accepts), so the reachable end is chosen instead.
+  def test_the_front_most_row_is_pickable_from_a_full_rack_on_the_rear_anchor(self):
+    # The workable single-tip pattern on a ganged head: take the front-most row
+    # anchored on the REAR nozzle, so the idle seven extend past the front edge
+    # over nothing. Consuming a rack front-to-back keeps that true every time.
     flex, transport, head, rack = self._bench()
     try:
-      asyncio.run(head.pick_up_single_tip(rack, well="C3"))
+      asyncio.run(head.pick_up_single_tip(rack, well="H3"))
       self.assertEqual(self._nozzle_params(transport)[-1]["primaryNozzle"], "A1")
       pickups = [c for c in transport.commands if c["commandType"] == "pickUpTip"]
-      self.assertEqual(pickups[-1]["params"]["wellName"], "C3")
+      self.assertEqual(pickups[-1]["params"]["wellName"], "H3")
       self.assertIsNotNone(head.get_mounted_tips()[0])
     finally:
       asyncio.run(flex.stop())
 
-  def test_explicit_nozzle_reaches_a_middle_row_well_on_its_own_channel(self):
-    # In a SINGLE layout the engine moves the chosen nozzle over whatever
-    # well is named, so the tip lands on that nozzle's channel, not the
-    # well's row.
+  def test_the_anchor_nozzle_decides_the_channel_not_the_wells_row(self):
+    # In a SINGLE layout the engine moves the chosen nozzle over whatever well
+    # is named, so the tip lands on that nozzle's channel. Row A is the rear
+    # nozzle's own row, and naming H1 still puts the tip on channel 7.
     flex, transport, head, rack = self._bench()
     try:
-      asyncio.run(head.pick_up_single_tip(rack, well="C3", primary_nozzle="H1"))
+      asyncio.run(head.pick_up_single_tip(rack, well="A3", primary_nozzle="H1"))
 
       self.assertEqual(self._nozzle_params(transport)[-1]["primaryNozzle"], "H1")
       pickups = [c for c in transport.commands if c["commandType"] == "pickUpTip"]
-      self.assertEqual(pickups[-1]["params"]["wellName"], "C3")
+      self.assertEqual(pickups[-1]["params"]["wellName"], "A3")
       self.assertIsNotNone(head.get_mounted_tips()[7])
       self.assertTrue(all(tip is None for i, tip in enumerate(head.get_mounted_tips()) if i != 7))
     finally:
       asyncio.run(flex.stop())
 
-  def test_row_letter_default_picks_that_rows_nozzle(self):
+  def test_a_rear_row_refuses_the_default_anchor_and_names_the_front_one(self):
+    # Ganged nozzles descend together, so the REAR anchor on a rear row puts the
+    # idle seven over rows B-H: eight tips. Refused, not silently swapped.
     flex, transport, head, rack = self._bench()
     try:
-      asyncio.run(head.pick_up_single_tip(rack, well="A2"))
+      with self.assertRaises(ValueError) as caught:
+        asyncio.run(head.pick_up_single_tip(rack, well="A2"))
+      self.assertIn("more than one tip", str(caught.exception))
+      self.assertIn("Anchor on H1", str(caught.exception))
+
+      asyncio.run(head.pick_up_single_tip(rack, well="A2", primary_nozzle="H1"))
+      self.assertEqual(self._nozzle_params(transport)[-1]["primaryNozzle"], "H1")
+      self.assertIsNotNone(head.get_mounted_tips()[7])
+    finally:
+      asyncio.run(flex.stop())
+
+  def test_the_default_anchor_is_the_rear_nozzle_whatever_the_rack_holds(self):
+    # The anchor fixes where the idle seven hang for the tip's whole life, so it
+    # is declared, not derived: same call, same anchor, full rack or nearly bare.
+    for empty_the_rest in (False, True):
+      flex, transport, head, rack = self._bench()
+      try:
+        if empty_the_rest:
+          for spot in rack.get_all_items():
+            if spot.name != rack.get_item("H3").name and spot.has_tip():
+              spot.tracker.remove_tip(commit=True)
+        asyncio.run(head.pick_up_single_tip(rack, well="H3"))
+        self.assertEqual(self._nozzle_params(transport)[-1]["primaryNozzle"], "A1")
+        self.assertIsNotNone(head.get_mounted_tips()[0])
+      finally:
+        asyncio.run(flex.stop())
+
+  def test_a_full_rack_middle_row_is_refused_rather_than_taking_a_handful_of_tips(self):
+    # No anchor clears a middle row of a full rack: whichever end you pick,
+    # some idle nozzles sit over tips. Refusing beats silently taking several.
+    flex, _transport, head, rack = self._bench()
+    try:
+      with self.assertRaises(ValueError) as caught:
+        asyncio.run(head.pick_up_single_tip(rack, well="D2"))
+      self.assertIn("more than one tip", str(caught.exception))
+    finally:
+      asyncio.run(flex.stop())
+
+  def test_a_middle_row_is_allowed_once_its_neighbours_are_already_empty(self):
+    # Same well, but with the rest of the column consumed the idle nozzles have
+    # nothing to engage, so the pick really is single.
+    flex, transport, head, rack = self._bench()
+    try:
+      for spot in rack.get_all_items():
+        if spot.name != rack.get_item("D2").name and spot.has_tip():
+          spot.tracker.remove_tip(commit=True)
+      asyncio.run(head.pick_up_single_tip(rack, well="D2"))
       self.assertEqual(self._nozzle_params(transport)[-1]["primaryNozzle"], "A1")
-      self.assertIsNotNone(head.get_mounted_tips()[0])
     finally:
       asyncio.run(flex.stop())
 
@@ -923,7 +1002,7 @@ class TestSingleNozzleLayout(unittest.TestCase):
     plate.ot_load_name = "corning_96_wellplate_360ul_flat"  # type: ignore[attr-defined]
     flex.deck.assign_child_at_slot(plate, "C2")
     try:
-      asyncio.run(head.pick_up_single_tip(rack, well="A1"))
+      asyncio.run(head.pick_up_single_tip(rack, well="A1", primary_nozzle="H1"))
       commands_before = len(transport.commands)
 
       # A column op resets the layout to ALL, which the robot refuses while
@@ -938,7 +1017,7 @@ class TestSingleNozzleLayout(unittest.TestCase):
   def test_dropping_the_single_tip_restores_all_mode(self):
     flex, transport, head, rack = self._bench()
     try:
-      asyncio.run(head.pick_up_single_tip(rack, well="A1"))
+      asyncio.run(head.pick_up_single_tip(rack, well="A1", primary_nozzle="H1"))
       asyncio.run(head.drop_single_tip(flex.deck.get_trash_area()))
 
       self.assertEqual(self._nozzle_params(transport)[-1], {"style": "ALL"})
@@ -951,7 +1030,7 @@ class TestSingleNozzleLayout(unittest.TestCase):
     # reset the robot refuses while the tip is still on.
     flex, transport, head, rack = self._bench()
     try:
-      asyncio.run(head.pick_up_single_tip(rack, well="A1"))
+      asyncio.run(head.pick_up_single_tip(rack, well="A1", primary_nozzle="H1"))
       asyncio.run(head.discard_tips(flex.deck.get_trash_area()))
 
       self.assertTrue(all(tip is None for tip in head.get_mounted_tips()))
@@ -965,7 +1044,7 @@ class TestSingleNozzleLayout(unittest.TestCase):
   def test_returning_a_cherry_picked_tip_to_a_rack_column_names_the_op_that_works(self):
     flex, transport, head, rack = self._bench()
     try:
-      asyncio.run(head.pick_up_single_tip(rack, well="A1"))
+      asyncio.run(head.pick_up_single_tip(rack, well="A1", primary_nozzle="H1"))
       commands_before = len(transport.commands)
 
       with self.assertRaises(OpentronsError) as caught:
@@ -988,12 +1067,21 @@ class TestSingleNozzleLayout(unittest.TestCase):
     finally:
       asyncio.run(flex.stop())
 
-  def test_a_front_row_well_anchors_on_the_nozzle_that_reaches_it(self):
+  def test_on_a_front_slot_one_anchor_cannot_reach_and_the_other_cannot_clear(self):
+    # On a front slot the rear anchor overruns the robot's front limit and the
+    # front anchor hangs the idle seven back over full rows. Each refusal says which.
     flex, transport, head, rack = self._bench(slot="D1")
     try:
-      asyncio.run(head.pick_up_single_tip(rack, well="F1"))
-      self.assertEqual(self._nozzle_params(transport)[-1]["primaryNozzle"], "H1")
-      self.assertIsNotNone(head.get_mounted_tips()[7])
+      commands_before = len(transport.commands)
+      with self.assertRaises(ValueError) as reach:
+        asyncio.run(head.pick_up_single_tip(rack, well="F1", primary_nozzle="A1"))
+      self.assertIn("outside the robot", str(reach.exception))
+
+      with self.assertRaises(ValueError) as clearance:
+        asyncio.run(head.pick_up_single_tip(rack, well="F1", primary_nozzle="H1"))
+      self.assertIn("more than one tip", str(clearance.exception))
+
+      self.assertEqual(len(transport.commands), commands_before, "must not reach the wire")
     finally:
       asyncio.run(flex.stop())
 
@@ -1022,7 +1110,7 @@ class TestSingleNozzleLayout(unittest.TestCase):
 
   def test_stop_leaves_no_cherry_picked_tip_on_the_pipette(self):
     flex, transport, head, rack = self._bench()
-    asyncio.run(head.pick_up_single_tip(rack, well="A1"))
+    asyncio.run(head.pick_up_single_tip(rack, well="A1", primary_nozzle="H1"))
 
     asyncio.run(flex.stop())
 
@@ -1477,17 +1565,319 @@ class TestUnsafeRecoveryOps(unittest.TestCase):
     finally:
       asyncio.run(flex.stop())
 
-  def test_unsafe_ops_without_a_tip_raise_and_send_nothing(self):
+  def test_unsafe_ops_still_run_when_this_process_knows_of_no_tip(self):
+    # The old contract refused these unless this head's own bookkeeping showed a
+    # tip. That bookkeeping is per-process and empty after any restart, which is
+    # exactly when a tip is stranded on the nozzle and these calls are the only
+    # way off it. Guarding on it made the escape hatch refuse in the one
+    # situation it exists for, so the guard is gone and the commands go out.
     flex, transport, head, _rack = self._bench()
     try:
-      for op in (
-        head.unsafe_drop_tip_in_place,
-        lambda: head.unsafe_blow_out_in_place(flow_rate=20.0),
+      self.assertTrue(all(tip is None for tip in head.get_mounted_tips()))
+      for op, expected in (
+        (head.unsafe_drop_tip_in_place, "unsafe/dropTipInPlace"),
+        (lambda: head.unsafe_blow_out_in_place(flow_rate=20.0), "unsafe/blowOutInPlace"),
       ):
         n_before = len(transport.commands)
-        with self.assertRaises(OpentronsError):
-          asyncio.run(op())
-        self.assertEqual(len(transport.commands), n_before, "rejection must not reach the wire")
+        asyncio.run(op())
+        sent = [c["commandType"] for c in transport.commands[n_before:]]
+        self.assertIn(expected, sent)
+    finally:
+      asyncio.run(flex.stop())
+
+
+class TestContainerAndSingleNozzleProbes(unittest.TestCase):
+  """The two probe shapes the heads had no way to reach.
+
+  A bare ``Container`` has no itemized parent, so the well-addressed probe could
+  not name it. A cherry-picked tip cannot use the column probe either, because
+  that resets the head to ALL nozzle mode and the reset is refused while a tip is
+  mounted. Both answer in DECK space like every other probe.
+  """
+
+  def setUp(self):
+    set_tip_tracking(True)
+    set_volume_tracking(True)
+
+  def tearDown(self):
+    set_tip_tracking(False)
+    set_volume_tracking(False)
+
+  def _rack_and_trough(self, flex):
+    rack = flex_96_tiprack_50ul(name="rack")
+    trough = _make_trough(name="trough")
+    flex.deck.assign_child_at_slot(rack, "C1")
+    flex.deck.assign_child_at_slot(trough, "C2")
+    return rack, trough
+
+  def test_single_channel_probes_a_container_at_its_sole_well(self):
+    flex, transport, head = _flex_head1(liquid_probe_z=9.0)
+    try:
+      rack, trough = self._rack_and_trough(flex)
+      asyncio.run(head.pick_up_tips(rack.get_item("A1")))
+
+      self.assertEqual(asyncio.run(head.liquid_probe(trough)), 9.0)
+      probe_cmds = [c for c in transport.commands if c["commandType"] == "liquidProbe"]
+      self.assertEqual(len(probe_cmds), 1)
+      self.assertEqual(probe_cmds[0]["params"]["wellName"], "A1")
+    finally:
+      asyncio.run(flex.stop())
+
+  def test_eight_channel_probes_a_container_with_one_command(self):
+    flex, transport, head = _flex_head8(liquid_probe_z=9.0)
+    try:
+      rack, trough = self._rack_and_trough(flex)
+      asyncio.run(head.pick_up_tips(rack, column=0))
+
+      self.assertEqual(asyncio.run(head.liquid_probe_container(trough)), 9.0)
+      probe_cmds = [c for c in transport.commands if c["commandType"] == "liquidProbe"]
+      self.assertEqual(len(probe_cmds), 1)
+      self.assertEqual(probe_cmds[0]["params"]["wellName"], "A1")
+    finally:
+      asyncio.run(flex.stop())
+
+  def test_try_probe_of_a_container_reports_none_when_it_finds_nothing(self):
+    flex, _transport, head = _flex_head8()
+    try:
+      rack, trough = self._rack_and_trough(flex)
+      asyncio.run(head.pick_up_tips(rack, column=0))
+
+      self.assertIsNone(asyncio.run(head.try_liquid_probe_container(trough)))
+    finally:
+      asyncio.run(flex.stop())
+
+  def test_a_cherry_picked_tip_probes_one_well_without_resetting_the_layout(self):
+    flex, transport, head = _flex_head8(liquid_probe_z=9.0)
+    try:
+      rack = flex_96_tiprack_50ul(name="rack")
+      plate = cor_96_wellplate_360uL_Fb(name="plate")
+      plate.ot_load_name = _CORNING_FLAT  # type: ignore[attr-defined]
+      flex.deck.assign_child_at_slot(rack, "C1")
+      flex.deck.assign_child_at_slot(plate, "C2")
+      asyncio.run(head.pick_up_single_tip(rack, well="A1", primary_nozzle="H1"))
+
+      self.assertEqual(asyncio.run(head.liquid_probe_single(plate, well="B3")), 9.0)
+      probe_cmds = [c for c in transport.commands if c["commandType"] == "liquidProbe"]
+      self.assertEqual(len(probe_cmds), 1)
+      self.assertEqual(probe_cmds[0]["params"]["wellName"], "B3")
+    finally:
+      asyncio.run(flex.stop())
+
+
+class TestWellBottomDeckZ(unittest.TestCase):
+  """Where a well's floor sits in deck space.
+
+  A probe answers in DECK space, and a caller that wants a height above the well
+  floor needs that floor to subtract. Only the run knows it: labware loaded by an
+  official Opentrons name is placed by vendor geometry PyLabRobot never sees, so
+  the definition the run reported is the answer and the PLR resource is not.
+  """
+
+  def _trough_on_deck(self, flex, official=True):
+    trough = _make_trough(name="trough")
+    if not official:
+      del trough.ot_load_name  # type: ignore[attr-defined]
+    flex.deck.assign_child_at_slot(trough, "C2")
+    return trough
+
+  def test_it_reads_the_definition_the_robot_reported(self):
+    flex, _transport, _head = _flex_head1(robot_labware_definitions=_ROBOT_DEFINITIONS)
+    try:
+      trough = self._trough_on_deck(flex)
+      asyncio.run(flex._ensure_labware_loaded(trough))
+
+      self.assertAlmostEqual(flex.well_bottom_deck_z(trough, "A1"), _NEST_FLOOR_Z)
+    finally:
+      asyncio.run(flex.stop())
+
+  def test_an_uploaded_definition_answers_for_labware_the_robot_lacks(self):
+    """Labware with no official name is loaded from a definition PyLabRobot
+    uploads, and the robot echoes that one back."""
+    flex, transport, _head = _flex_head1()
+    try:
+      trough = self._trough_on_deck(flex, official=False)
+      asyncio.run(flex._ensure_labware_loaded(trough))
+
+      # The uploaded definition puts the cavity floor at the container's material
+      # thickness, which _make_trough declares as 1.0 mm.
+      self.assertAlmostEqual(flex.well_bottom_deck_z(trough, "A1"), 1.0)
+      self.assertEqual(len(transport.labware_definitions), 1)
+    finally:
+      asyncio.run(flex.stop())
+
+  def test_it_refuses_when_the_run_reported_no_definition(self):
+    flex, _transport, _head = _flex_head1()
+    try:
+      trough = self._trough_on_deck(flex)  # official name, robot holds no definition
+      asyncio.run(flex._ensure_labware_loaded(trough))
+
+      with self.assertRaises(OpentronsError) as caught:
+        flex.well_bottom_deck_z(trough, "A1")
+      self.assertIn("no definition", str(caught.exception))
+    finally:
+      asyncio.run(flex.stop())
+
+  def test_it_refuses_when_an_offset_moved_the_labware(self):
+    class _OffsetTransport(ChatterboxTransport):
+      """A run that applied a labware offset, which shifts the labware off where
+      its definition puts it."""
+
+      async def post(self, path: str, json: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        response = await super().post(path, json)
+        data = response.get("data", {})
+        if data.get("commandType") == "loadLabware":
+          data["result"]["offsetId"] = "offset-1"
+        return response
+
+    transport = _OffsetTransport(
+      pipettes=[("p1000_single_flex", 1, 1.0, 1000.0, "right")],
+      robot_labware_definitions=_ROBOT_DEFINITIONS,
+    )
+    flex = OpentronsFlex(deck=FlexDeck(), host="localhost", transport=transport)
+    asyncio.run(flex.setup())
+    try:
+      trough = self._trough_on_deck(flex)
+      asyncio.run(flex._ensure_labware_loaded(trough))
+
+      with self.assertRaises(OpentronsError) as caught:
+        flex.well_bottom_deck_z(trough, "A1")
+      self.assertIn("offset-1", str(caught.exception))
+    finally:
+      asyncio.run(flex.stop())
+
+  def test_it_refuses_a_well_the_definition_does_not_have(self):
+    flex, _transport, _head = _flex_head1(robot_labware_definitions=_ROBOT_DEFINITIONS)
+    try:
+      trough = self._trough_on_deck(flex)
+      asyncio.run(flex._ensure_labware_loaded(trough))
+
+      with self.assertRaises(OpentronsError) as caught:
+        flex.well_bottom_deck_z(trough, "H12")
+      self.assertIn("H12", str(caught.exception))
+    finally:
+      asyncio.run(flex.stop())
+
+  def test_every_term_of_the_sum_reaches_the_answer(self):
+    """The floor is where the labware sits, plus how far the definition lifts its
+    origin above the slot, plus how far the well's own floor sits above that
+    origin. All three were zero in the fixtures above, so dropping any of them
+    went unnoticed."""
+    lifted = {
+      _NEST_RESERVOIR: {
+        "parameters": {"loadName": _NEST_RESERVOIR},
+        "schemaVersion": 2,
+        "cornerOffsetFromSlot": {"x": 0, "y": 0, "z": 4.0},
+        "wells": {"A1": {"z": 2.5, "depth": 25.0}},
+      }
+    }
+    flex, _transport, _head = _flex_head1(robot_labware_definitions=lifted)
+    try:
+      trough = self._trough_on_deck(flex)
+      asyncio.run(flex._ensure_labware_loaded(trough))
+      slot_z = trough.get_absolute_location(z="b").z
+
+      self.assertAlmostEqual(flex.well_bottom_deck_z(trough, "A1"), slot_z + 4.0 + 2.5)
+
+      trough.location = Coordinate(trough.location.x, trough.location.y, trough.location.z + 10.0)
+      self.assertAlmostEqual(flex.well_bottom_deck_z(trough, "A1"), slot_z + 10.0 + 4.0 + 2.5)
+    finally:
+      asyncio.run(flex.stop())
+
+  def test_a_schema_3_definition_puts_its_origin_on_the_slot(self):
+    """Schema 3 has no ``cornerOffsetFromSlot``: the labware origin IS the slot
+    origin, so the floor is the slot plus the well's own z and nothing else.
+
+    Its ``extents`` are not that distance under another name. The schema states
+    them "relative to the labware origin", which is the thing being located, and
+    a nonzero one here would show up as a floor that many mm too high."""
+    schema3 = {
+      _NEST_RESERVOIR: {
+        "parameters": {"loadName": _NEST_RESERVOIR},
+        "schemaVersion": 3,
+        "extents": {"total": {"backLeftBottom": {"x": -3.0, "y": 3.0, "z": 4.0}}},
+        "wells": {"A1": {"z": 2.5, "depth": 25.0}},
+      }
+    }
+    flex, _transport, _head = _flex_head1(robot_labware_definitions=schema3)
+    try:
+      trough = self._trough_on_deck(flex)
+      asyncio.run(flex._ensure_labware_loaded(trough))
+      slot_z = trough.get_absolute_location(z="b").z
+
+      self.assertAlmostEqual(flex.well_bottom_deck_z(trough, "A1"), slot_z + 2.5)
+    finally:
+      asyncio.run(flex.stop())
+
+  def test_it_refuses_a_schema_it_has_not_been_taught(self):
+    """Reading an unknown schema as zero would put every floor out by however far
+    that schema says the labware sits above its slot."""
+    schema4 = {
+      _NEST_RESERVOIR: {
+        "parameters": {"loadName": _NEST_RESERVOIR},
+        "schemaVersion": 4,
+        "wells": {"A1": {"z": 2.5, "depth": 25.0}},
+      }
+    }
+    flex, _transport, _head = _flex_head1(robot_labware_definitions=schema4)
+    try:
+      trough = self._trough_on_deck(flex)
+      asyncio.run(flex._ensure_labware_loaded(trough))
+
+      with self.assertRaises(OpentronsError) as caught:
+        flex.well_bottom_deck_z(trough, "A1")
+      self.assertIn("does not read", str(caught.exception))
+    finally:
+      asyncio.run(flex.stop())
+
+  def test_it_refuses_a_schema_2_definition_that_never_states_the_offset(self):
+    """The field is required by schema 2, so one without it is a definition this
+    driver cannot place -- not one sitting on its slot."""
+    silent = {
+      _NEST_RESERVOIR: {
+        "parameters": {"loadName": _NEST_RESERVOIR},
+        "schemaVersion": 2,
+        "wells": {"A1": {"z": 2.5, "depth": 25.0}},
+      }
+    }
+    flex, _transport, _head = _flex_head1(robot_labware_definitions=silent)
+    try:
+      trough = self._trough_on_deck(flex)
+      asyncio.run(flex._ensure_labware_loaded(trough))
+
+      with self.assertRaises(OpentronsError) as caught:
+        flex.well_bottom_deck_z(trough, "A1")
+      self.assertIn("does not read", str(caught.exception))
+    finally:
+      asyncio.run(flex.stop())
+
+  def test_an_offset_applied_after_the_load_still_refuses(self):
+    """A reload re-places the labware and reports the offset it applied. Left
+    uncarried, the ``None`` recorded at load time reads as "no offset"."""
+
+    class _ReloadOffsetTransport(ChatterboxTransport):
+      async def post(self, path: str, json: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        response = await super().post(path, json)
+        data = response.get("data", {})
+        if data.get("commandType") == "reloadLabware":
+          data["result"]["offsetId"] = "offset-after-reload"
+        return response
+
+    transport = _ReloadOffsetTransport(
+      pipettes=[("p1000_single_flex", 1, 1.0, 1000.0, "right")],
+      robot_labware_definitions=_ROBOT_DEFINITIONS,
+    )
+    flex = OpentronsFlex(deck=FlexDeck(), host="localhost", transport=transport)
+    asyncio.run(flex.setup())
+    try:
+      trough = self._trough_on_deck(flex)
+      asyncio.run(flex._ensure_labware_loaded(trough))
+      self.assertAlmostEqual(flex.well_bottom_deck_z(trough, "A1"), _NEST_FLOOR_Z)
+
+      asyncio.run(flex.reload_labware(trough))
+
+      with self.assertRaises(OpentronsError) as caught:
+        flex.well_bottom_deck_z(trough, "A1")
+      self.assertIn("offset-after-reload", str(caught.exception))
     finally:
       asyncio.run(flex.stop())
 
