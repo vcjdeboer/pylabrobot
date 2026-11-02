@@ -1,0 +1,65 @@
+﻿:orphan:
+
+
+pylabrobot.brooks.precise\_flex.PreciseFlexConfiguration
+========================================================
+
+.. currentmodule:: pylabrobot.brooks.precise_flex
+
+.. autoclass:: PreciseFlexConfiguration
+
+   
+   
+   .. rubric:: Attributes
+
+   .. autosummary::
+      :toctree: .
+   
+      ~PreciseFlexConfiguration.camera_count
+      ~PreciseFlexConfiguration.gripper_width_range
+      ~PreciseFlexConfiguration.hard_limits
+      ~PreciseFlexConfiguration.has_rail
+      ~PreciseFlexConfiguration.has_vision_gripper
+      ~PreciseFlexConfiguration.has_vision_server
+      ~PreciseFlexConfiguration.is_dual_gripper
+      ~PreciseFlexConfiguration.is_vision_gripper
+      ~PreciseFlexConfiguration.kinematics
+      ~PreciseFlexConfiguration.kinematics_source
+      ~PreciseFlexConfiguration.max_cartesian_acceleration
+      ~PreciseFlexConfiguration.max_cartesian_speed
+      ~PreciseFlexConfiguration.max_joint_acceleration
+      ~PreciseFlexConfiguration.max_joint_deceleration
+      ~PreciseFlexConfiguration.max_joint_speed
+      ~PreciseFlexConfiguration.power_state
+      ~PreciseFlexConfiguration.rail
+      ~PreciseFlexConfiguration.reach_class
+      ~PreciseFlexConfiguration.soft_limits
+      ~PreciseFlexConfiguration.work_envelope
+      ~PreciseFlexConfiguration.z_range
+      ~PreciseFlexConfiguration.manufacturer
+      ~PreciseFlexConfiguration.controller_model
+      ~PreciseFlexConfiguration.hardware_version
+      ~PreciseFlexConfiguration.gpl_version
+      ~PreciseFlexConfiguration.controller_serial
+      ~PreciseFlexConfiguration.robot_name
+      ~PreciseFlexConfiguration.robot_type
+      ~PreciseFlexConfiguration.tcs_version
+      ~PreciseFlexConfiguration.modules
+      ~PreciseFlexConfiguration.num_axes
+      ~PreciseFlexConfiguration.extra_axes
+      ~PreciseFlexConfiguration.axis_mask
+      ~PreciseFlexConfiguration.arm
+      ~PreciseFlexConfiguration.gripper
+   
+   
+
+   
+   
+   .. rubric:: Methods
+
+   .. autosummary::
+      :toctree: .
+   
+      ~PreciseFlexConfiguration.__init__
+   
+   
