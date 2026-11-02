@@ -44,6 +44,16 @@ def free_ports(count: int) -> List[int]:
       sock.close()
 
 
+def has_ipv6_loopback() -> bool:
+  """Whether this machine can bind `::1`; some containers have no IPv6 at all."""
+  try:
+    with socket.socket(socket.AF_INET6) as sock:
+      sock.bind(("::1", 0))
+    return True
+  except OSError:
+    return False
+
+
 def empty_facility() -> Facility:
   """A facility with nothing in it, of a size every test here can place things in."""
   return Facility(name="facility", size_x=1000, size_y=1000, size_z=500)
@@ -625,6 +635,7 @@ class BindTests(unittest.IsolatedAsyncioTestCase):
       await viewer.start()
     self.assertEqual(viewer.ws_port, WS_PORT)
 
+  @unittest.skipUnless(has_ipv6_loopback(), "this machine cannot bind ::1")
   async def test_an_ipv6_host_serves_both_ports(self):
     """The file server was bound as IPv4 whatever the host, so `::1` bound the websocket and then
     hung forever walking ports for a file server that could never bind one."""
